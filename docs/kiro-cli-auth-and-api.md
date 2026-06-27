@@ -163,6 +163,153 @@ arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK
 
 ---
 
+## ★ 实测验证（2026-06-27，经 clash 7897 用现有 token 实调）★
+
+> 以下是**实际跑通**的协议，可直接照此实现，无需再猜。PoC 脚本：`/tmp/kiro_poc.py`
+
+### 端点与公共头
+
+```
+POST https://codewhisperer.us-east-1.amazonaws.com/
+                              ^^^^^^^^^ API 固定在 us-east-1，与 SSO region(ap-northeast-1) 无关
+
+公共请求头：
+  Content-Type: application/x-amz-json-1.0
+  Authorization: Bearer <access_token>          ← 不是 x-amz-sso_bearer_token
+  User-Agent: ...AmazonQ-For-CLI/<ver> kirocli/<ver>   ← 必须！否则 403 "subscription does not support this application"
+  x-amzn-codewhisperer-optout: true             ← 数据不用于训练
+```
+
+**关键坑**：User-Agent 必须包含 `AmazonQ-For-CLI` / `kirocli` 应用标识，否则后端返回 `403 AccessDeniedException: Your subscription does not support this application`。这是应用级订阅门控。
+
+### 步骤 1：ListAvailableProfiles（获取 profileArn）
+
+```
+X-Amz-Target: AmazonCodeWhispererService.ListAvailableProfiles
+Body: {"maxResults": 10}
+
+→ 200, 返回:
+{"profiles":[{
+  "arn":"arn:aws:codewhisperer:us-east-1:471112993982:profile/GMAUN4KMEDEV",
+  "profileName":"KiroProfile-us-east-1",
+  "identityDetails":{"ssoIdentityDetails":{"ssoRegion":"ap-northeast-1", ...}}
+}]}
+```
+
+profileArn 不在本地 token 里，**必须先调这个接口拿到**（可缓存）。
+
+### 步骤 2：GenerateAssistantResponse（流式聊天）
+
+```
+X-Amz-Target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 注意是 Streaming 服务
+Body:
+{
+  "conversationState": {
+    "chatTriggerType": "MANUAL",
+    "currentMessage": {
+      "userInputMessage": {
+        "content": "用户消息文本",
+        "origin": "CLI"
+      }
+    }
+  },
+  "profileArn": "arn:aws:codewhisperer:us-east-1:471112993982:profile/GMAUN4KMEDEV"
+}
+
+→ 200, Content-Type: application/vnd.amazon.eventstream（AWS 二进制事件流）
+```
+
+### 响应：event-stream 解析
+
+AWS event-stream 帧格式（大端）：
+```
+[total_len:4][headers_len:4][prelude_crc:4][headers][payload][msg_crc:4]
+headers 每项: [name_len:1][name][type:1][value...]，:event-type 是 string(type=7)
+```
+
+实测返回的事件序列：
+```
+[initial-response]        {}
+[assistantResponseEvent]  {"content":"hello","modelId":"claude-sonnet-4.5"}
+[assistantResponseEvent]  {"content":" from kiro","modelId":"claude-sonnet-4.5"}
+...
+```
+
+**后端模型**：`claude-sonnet-4.5`（即 Kiro 用 Claude 作为底模）。
+
+### conversationState 完整结构（来自开源 Smithy 模型）
+
+```
+GenerateAssistantResponseInput = { conversationState, profileArn, agentMode }
+ConversationState = {
+  conversationId?: string,
+  history?: [ChatMessage],          ← 多轮历史
+  currentMessage: ChatMessage,
+  chatTriggerType: "MANUAL"|"DIAGNOSTIC",
+}
+ChatMessage = { userInputMessage } | { assistantResponseMessage }
+UserInputMessage = {
+  content: string,
+  userInputMessageContext?: { editorState?, toolResults?, tools? },
+  userIntent?: string,
+  origin: "CLI"|"IDE"|...,
+  images?: [...],
+  modelId?: string,                 ← 可指定模型
+}
+```
+
+源码参考：`crates/amzn-codewhisperer-streaming-client/src/operation/generate_assistant_response/` 和 `src/types/` (ConversationState、UserInputMessage)。
+
+### 工具调用（Tool Use）—— 已实测往返验证
+
+**工具定义**（请求 `userInputMessageContext.tools`）：
+```json
+{"toolSpecification": {
+  "name": "get_weather",
+  "description": "...",
+  "inputSchema": {"json": { /* JSON Schema */ }}
+}}
+```
+
+**TURN 1 响应**（流式 toolUseEvent，input 分片拼接）：
+```
+[assistantResponseEvent] {"content":"I'll check the weather...","modelId":"claude-sonnet-4.5"}
+[toolUseEvent] {"name":"get_weather","toolUseId":"tooluse_RAO1..."}
+[toolUseEvent] {"input":"{\"","name":"get_weather","toolUseId":"..."}
+[toolUseEvent] {"input":"ci",...}              ← input 是流式 JSON 分片，需拼接
+[toolUseEvent] {"input":"ty\": \"Tokyo\"}",...}
+[toolUseEvent] {"name":"get_weather","stop":true,"toolUseId":"..."}   ← stop:true 表示结束
+```
+
+**TURN 2 回传工具结果**（history + currentMessage.toolResults）：
+```json
+{"conversationState": {
+  "chatTriggerType": "MANUAL",
+  "history": [
+    {"userInputMessage": {"content":"...","origin":"CLI","userInputMessageContext":{"tools":[...]}}},
+    {"assistantResponseMessage": {"content":"...","toolUses":[{"toolUseId":"...","name":"get_weather","input":{"city":"Tokyo"}}]}}
+  ],
+  "currentMessage": {"userInputMessage": {
+    "content": "",
+    "origin": "CLI",
+    "userInputMessageContext": {
+      "tools": [...],
+      "toolResults": [{"toolUseId":"...","content":[{"json":{"temp_c":22,"condition":"Sunny"}}],"status":"success"}]
+    }
+  }}
+}}
+→ [assistantResponseEvent] "The weather in Tokyo is currently sunny with a temperature of 22°C."
+```
+
+**映射要点**：
+- Anthropic `tool_use` block ↔ CW `toolUses`；Anthropic `tool_result` block ↔ CW `toolResults`
+- OpenAI `tool_calls` ↔ CW `toolUses`；OpenAI `role:tool` message ↔ CW `toolResults`
+- toolResult content 支持 `{json:...}` 或 `{text:...}`，status `success`/`error`
+- PoC 脚本：`/tmp/kiro_tool_poc.py`（已跑通）
+
+---
+
 ## 六、API 协议
 
 Kiro CLI 使用 **AWS CodeWhisperer API（Smithy/gRPC over HTTPS）**。

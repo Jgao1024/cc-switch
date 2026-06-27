@@ -37,6 +37,7 @@ import { ApiKeySection, EndpointField, ModelInputWithFetch } from "./shared";
 import { CopilotAuthSection } from "./CopilotAuthSection";
 import { CodexOAuthSection } from "./CodexOAuthSection";
 import { KiroAuthSection } from "./KiroAuthSection";
+import { kiroListModels } from "@/lib/api/kiro";
 import {
   copilotGetModels,
   copilotGetModelsForAccount,
@@ -254,6 +255,10 @@ export function ClaudeFormFields({
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
 
+  // Kiro (Amazon Q) 模型获取
+  const [kiroModels, setKiroModels] = useState<FetchedModel[]>([]);
+  const [kiroModelsLoading, setKiroModelsLoading] = useState(false);
+
   const showModelFetchResult = useCallback(
     (count: number) => {
       if (count === 0) {
@@ -293,6 +298,20 @@ export function ClaudeFormFields({
       })
       .finally(() => setIsFetchingModels(false));
   }, [baseUrl, apiKey, isFullUrl, customUserAgent, showModelFetchResult, t]);
+
+  const handleFetchKiroModels = useCallback(() => {
+    setKiroModelsLoading(true);
+    kiroListModels()
+      .then((models) => {
+        setKiroModels(models);
+        showModelFetchResult(models.length);
+      })
+      .catch((err) => {
+        console.warn("[Kiro] Failed to fetch models:", err);
+        showFetchModelsError(err, t);
+      })
+      .finally(() => setKiroModelsLoading(false));
+  }, [showModelFetchResult, t]);
 
   const handleFetchCopilotModels = useCallback(() => {
     if (!isCopilotAuthenticated) {
@@ -390,12 +409,16 @@ export function ClaudeFormFields({
     ? modelsLoading
     : isCodexOauthPreset
       ? codexOauthModelsLoading
-      : isFetchingModels;
+      : isKiroPreset
+        ? kiroModelsLoading
+        : isFetchingModels;
   const handleModelFetchClick = isCopilotPreset
     ? handleFetchCopilotModels
     : isCodexOauthPreset
       ? handleFetchCodexOauthModels
-      : handleFetchModels;
+      : isKiroPreset
+        ? handleFetchKiroModels
+        : handleFetchModels;
 
   // 模型输入框：支持手动输入 + 下拉选择
   const renderModelInput = (
@@ -417,6 +440,19 @@ export function ClaudeFormFields({
           placeholder={placeholder}
           fetchedModels={codexOauthModels}
           isLoading={codexOauthModelsLoading}
+        />
+      );
+    }
+
+    if (isKiroPreset) {
+      return (
+        <ModelInputWithFetch
+          id={id}
+          value={value}
+          onChange={updateValue}
+          placeholder={placeholder}
+          fetchedModels={kiroModels}
+          isLoading={kiroModelsLoading}
         />
       );
     }

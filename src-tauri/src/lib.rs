@@ -1490,6 +1490,7 @@ pub fn run() {
             commands::kiro_has_cli_credentials,
             commands::kiro_is_authenticated,
             commands::kiro_prefetch_profile,
+            commands::kiro_list_models,
             // OMO commands
             commands::read_omo_local_file,
             commands::get_current_omo_provider_id,

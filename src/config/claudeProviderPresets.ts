@@ -1140,10 +1140,10 @@ export const providerPresets: ProviderPreset[] = [
       env: {
         // base_url 仅作占位；Kiro 请求由本地代理拦截并改走 CodeWhisperer。
         ANTHROPIC_BASE_URL: "https://codewhisperer.us-east-1.amazonaws.com",
-        ANTHROPIC_MODEL: "claude-sonnet-4.5",
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-sonnet-4.5",
-        ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4.5",
-        ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-sonnet-4.5",
+        ANTHROPIC_MODEL: "claude-sonnet-4.6",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-sonnet-4.6",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4.6",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-4.8",
         ANTHROPIC_AUTH_TOKEN: "kiro",
       },
       // 上游代理（CodeWhisperer 在海外，按需经代理转发）。

@@ -24,6 +24,8 @@ pub mod protocol {
     /// 非流式服务前缀（ListAvailableProfiles / GetUsageLimits 等）
     pub const TARGET_LIST_PROFILES: &str =
         "AmazonCodeWhispererService.ListAvailableProfiles";
+    /// 列出可用模型
+    pub const TARGET_LIST_MODELS: &str = "AmazonCodeWhispererService.ListAvailableModels";
     /// 流式聊天操作
     pub const TARGET_GENERATE_ASSISTANT_RESPONSE: &str =
         "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
@@ -40,7 +42,7 @@ pub mod protocol {
     pub const HEADER_OPTOUT: &str = "x-amzn-codewhisperer-optout";
 
     /// 后端默认模型标识（响应中回传的 modelId）
-    pub const DEFAULT_MODEL_ID: &str = "claude-sonnet-4.5";
+    pub const DEFAULT_MODEL_ID: &str = "claude-sonnet-4.6";
 }
 
 /// kiro-cli 凭证（从其 SQLite auth_kv 表继承的字段子集）
@@ -386,6 +388,52 @@ impl KiroAuthManager {
         Ok(arn)
     }
 
+    /// 列出 CodeWhisperer 可用模型（origin=AI_EDITOR，含 sonnet-4.6 / opus-4.8 等）。
+    /// 返回 (modelId, description)。
+    pub async fn list_models(
+        &self,
+    ) -> Result<Vec<(String, Option<String>)>, KiroAuthError> {
+        let token = self.get_valid_token().await?;
+        let arn = self.get_profile_arn().await?;
+        let client = self.http_client()?;
+        let resp = client
+            .post(protocol::CW_ENDPOINT)
+            .header("Content-Type", protocol::CONTENT_TYPE_AMZ_JSON)
+            .header("X-Amz-Target", protocol::TARGET_LIST_MODELS)
+            .header("Authorization", format!("Bearer {token}"))
+            .header(protocol::HEADER_OPTOUT, "true")
+            .body(json!({ "profileArn": arn, "origin": "AI_EDITOR" }).to_string())
+            .send()
+            .await
+            .map_err(|e| KiroAuthError::Network(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| KiroAuthError::Network(e.to_string()))?;
+        if !status.is_success() {
+            return Err(KiroAuthError::Network(format!(
+                "ListAvailableModels HTTP {status}: {}",
+                text.chars().take(300).collect::<String>()
+            )));
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| KiroAuthError::Network(e.to_string()))?;
+        let mut out = Vec::new();
+        if let Some(models) = v.get("models").and_then(|m| m.as_array()) {
+            for m in models {
+                if let Some(id) = m.get("modelId").and_then(|x| x.as_str()) {
+                    let desc = m
+                        .get("description")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                    out.push((id.to_string(), desc));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// 发送 `GenerateAssistantResponse` 流式聊天请求。
     ///
     /// `cw_body` 为 `transform_kiro::anthropic_to_cw_request` 等产出的请求体
@@ -496,5 +544,16 @@ mod tests {
         let arn = mgr.get_profile_arn().await.expect("获取 profileArn 失败");
         println!("[live] profileArn = {arn}");
         assert!(arn.starts_with("arn:aws:codewhisperer:"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_list_models_via_clash() {
+        let mgr = KiroAuthManager::new(Some("http://127.0.0.1:7897".to_string()));
+        let models = mgr.list_models().await.expect("list_models failed");
+        let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
+        println!("[live] models = {ids:?}");
+        assert!(ids.iter().any(|m| m.contains("sonnet-4.6")));
+        assert!(ids.iter().any(|m| m.contains("opus-4.8")));
     }
 }

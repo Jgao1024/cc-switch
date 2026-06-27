@@ -9,6 +9,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import type { FetchedModel } from "./model-fetch";
 
 /**
  * 本地是否存在可直接继承的 kiro-cli 登录凭证。
@@ -36,4 +37,16 @@ export async function kiroIsAuthenticated(): Promise<boolean> {
  */
 export async function kiroPrefetchProfile(proxyUrl?: string): Promise<string> {
   return invoke<string>("kiro_prefetch_profile", { proxyUrl });
+}
+
+/**
+ * 列出 CodeWhisperer 可用模型（用于「获取模型列表」按钮）。
+ *
+ * @param proxyUrl 上游代理；缺省时后端回退到 cc-switch 全局出站代理
+ * @returns 模型列表（id + 描述）
+ */
+export async function kiroListModels(
+  proxyUrl?: string,
+): Promise<FetchedModel[]> {
+  return invoke<FetchedModel[]>("kiro_list_models", { proxyUrl });
 }

@@ -693,6 +693,15 @@ function ProviderFormFull({
       }));
   }, [appId]);
 
+  // 选中预设的 providerType。claude 走 templatePreset；codex 等其它应用
+  // templatePreset 为空，需直接从 presetEntries 命中项读取。
+  const selectedPresetProviderType = useMemo(() => {
+    const p = presetEntries.find((e) => e.id === selectedPresetId)?.preset as
+      | { providerType?: string }
+      | undefined;
+    return p?.providerType;
+  }, [presetEntries, selectedPresetId]);
+
   const {
     templateValues,
     templateValueEntries,
@@ -1137,6 +1146,7 @@ function ProviderFormFull({
       initialData?.meta?.providerType === "codex_oauth";
     const isKiroProvider =
       templatePreset?.providerType === "kiro" ||
+      selectedPresetProviderType === "kiro" ||
       initialData?.meta?.providerType === "kiro";
     if (isCopilotProvider && !isCopilotAuthenticated) {
       toast.error(
@@ -1217,7 +1227,7 @@ function ProviderFormFull({
             }),
           );
         }
-        if (!codexApiKey.trim()) {
+        if (!isKiroProvider && !codexApiKey.trim()) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
@@ -1444,7 +1454,9 @@ function ProviderFormFull({
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+      templatePreset?.providerType ||
+      selectedPresetProviderType ||
+      initialData?.meta?.providerType;
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
@@ -2145,6 +2157,7 @@ function ProviderFormFull({
               websiteUrl={codexWebsiteUrl}
               isPartner={isCodexPartner}
               partnerPromotionKey={codexPartnerPromotionKey}
+              isKiroPreset={selectedPresetProviderType === "kiro"}
               shouldShowSpeedTest={shouldShowSpeedTest}
               codexBaseUrl={codexBaseUrl}
               onBaseUrlChange={handleCodexBaseUrlChange}

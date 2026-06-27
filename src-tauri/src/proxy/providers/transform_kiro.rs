@@ -11,6 +11,38 @@ use serde_json::{json, Value};
 
 use super::kiro_auth::protocol;
 
+/// CodeWhisperer 请求的 origin。
+/// 用 `AI_EDITOR` 而非 `CLI`，以解锁完整模型集（含 claude-sonnet-4.6 / claude-opus-4.8）；
+/// `CLI` origin 仅暴露 sonnet-4.5/sonnet-4/haiku-4.5。
+const ORIGIN: &str = "AI_EDITOR";
+
+/// 将客户端请求的模型名映射到 CodeWhisperer 支持的 modelId。
+///
+/// - 已是合法 CW modelId 的，原样透传；
+/// - 含 "opus" → `claude-opus-4.8`；
+/// - 其余（sonnet / haiku / 未知）→ `claude-sonnet-4.6`。
+pub fn map_model_to_cw(requested: Option<&str>) -> String {
+    let m = requested.unwrap_or("").trim().to_ascii_lowercase();
+    const KNOWN: &[&str] = &[
+        "claude-opus-4.8",
+        "claude-opus-4.7",
+        "claude-opus-4.6",
+        "claude-opus-4.5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+        "auto",
+    ];
+    if KNOWN.contains(&m.as_str()) {
+        return m;
+    }
+    if m.contains("opus") {
+        return "claude-opus-4.8".to_string();
+    }
+    "claude-sonnet-4.6".to_string()
+}
+
 // ===================================================================
 // Part A: AWS event-stream 二进制解码器
 // ===================================================================
@@ -193,15 +225,24 @@ pub fn anthropic_to_cw_request(body: &Value) -> Value {
     }
 
     // currentMessage 必须是 userInputMessage；取末尾的 user 消息
-    let current = if matches!(
+    let mut current = if matches!(
         cw_msgs.last().and_then(|m| m.get("userInputMessage")),
         Some(_)
     ) {
         cw_msgs.pop().unwrap()
     } else {
         // 末尾不是 user（异常情况）：补一个空的 user 触发续写
-        json!({ "userInputMessage": { "content": "", "origin": "CLI" } })
+        json!({ "userInputMessage": { "content": "", "origin": ORIGIN } })
     };
+
+    // 注入映射后的 modelId（claude-sonnet-4.6 / claude-opus-4.8 等）
+    let model_id = map_model_to_cw(body.get("model").and_then(|m| m.as_str()));
+    if let Some(uim) = current
+        .get_mut("userInputMessage")
+        .and_then(|v| v.as_object_mut())
+    {
+        uim.insert("modelId".to_string(), json!(model_id));
+    }
 
     let mut conversation_state = json!({
         "chatTriggerType": "MANUAL",
@@ -294,7 +335,7 @@ fn anthropic_user_to_cw(msg: &Value, system: Option<&str>, tools: Option<&Vec<Va
 
     let mut out = json!({
         "content": text_parts.join("\n"),
-        "origin": "CLI",
+        "origin": ORIGIN,
     });
     if has_ctx {
         out["userInputMessageContext"] = ctx;
@@ -732,7 +773,7 @@ pub fn openai_chat_to_cw_request(body: &Value) -> Value {
                 cw_msgs.push(json!({
                     "userInputMessage": {
                         "content": "",
-                        "origin": "CLI",
+                        "origin": ORIGIN,
                         "userInputMessageContext": { "toolResults": std::mem::take(pending) }
                     }
                 }));
@@ -767,7 +808,7 @@ pub fn openai_chat_to_cw_request(body: &Value) -> Value {
                     system_injected = true;
                 }
                 cw_msgs.push(json!({
-                    "userInputMessage": { "content": text, "origin": "CLI" }
+                    "userInputMessage": { "content": text, "origin": ORIGIN }
                 }));
             }
         }
@@ -783,7 +824,7 @@ pub fn openai_chat_to_cw_request(body: &Value) -> Value {
     {
         cw_msgs.pop().unwrap()
     } else {
-        json!({ "userInputMessage": { "content": "", "origin": "CLI" } })
+        json!({ "userInputMessage": { "content": "", "origin": ORIGIN } })
     };
 
     // 工具定义挂到 currentMessage 上
@@ -798,6 +839,15 @@ pub fn openai_chat_to_cw_request(body: &Value) -> Value {
                 .or_insert_with(|| json!({}));
             ctx["tools"] = json!(t);
         }
+    }
+
+    // 注入映射后的 modelId
+    let model_id = map_model_to_cw(body.get("model").and_then(|m| m.as_str()));
+    if let Some(uim) = current
+        .get_mut("userInputMessage")
+        .and_then(|v| v.as_object_mut())
+    {
+        uim.insert("modelId".to_string(), json!(model_id));
     }
 
     let mut conversation_state = json!({
@@ -1196,12 +1246,24 @@ mod tests {
         });
         let cw = anthropic_to_cw_request(&body);
         let cur = &cw["conversationState"]["currentMessage"]["userInputMessage"];
-        assert_eq!(cur["origin"], "CLI");
+        assert_eq!(cur["origin"], "AI_EDITOR");
+        // 模型映射：sonnet → claude-sonnet-4.6
+        assert_eq!(cur["modelId"], "claude-sonnet-4.6");
         // system 注入到首条 user 文本
         assert!(cur["content"].as_str().unwrap().contains("You are helpful."));
         assert!(cur["content"].as_str().unwrap().contains("Hello"));
         assert_eq!(cw["conversationState"]["chatTriggerType"], "MANUAL");
         assert!(cw["conversationState"].get("history").is_none());
+    }
+
+    #[test]
+    fn test_model_mapping() {
+        assert_eq!(map_model_to_cw(Some("claude-opus-4-1-20250101")), "claude-opus-4.8");
+        assert_eq!(map_model_to_cw(Some("claude-3-5-sonnet")), "claude-sonnet-4.6");
+        assert_eq!(map_model_to_cw(Some("claude-3-5-haiku")), "claude-sonnet-4.6");
+        assert_eq!(map_model_to_cw(Some("claude-opus-4.8")), "claude-opus-4.8");
+        assert_eq!(map_model_to_cw(Some("claude-sonnet-4.6")), "claude-sonnet-4.6");
+        assert_eq!(map_model_to_cw(None), "claude-sonnet-4.6");
     }
 
     #[test]

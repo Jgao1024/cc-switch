@@ -27,6 +27,8 @@ import {
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
+import { KiroAuthSection } from "./KiroAuthSection";
+import { kiroListModels } from "@/lib/api/kiro";
 import {
   fetchModelsForConfig,
   showFetchModelsError,
@@ -56,6 +58,8 @@ interface CodexFormFieldsProps {
   websiteUrl: string;
   isPartner?: boolean;
   partnerPromotionKey?: string;
+  // Kiro (Amazon Q / CodeWhisperer)：继承 kiro-cli 凭证，无需 API Key
+  isKiroPreset?: boolean;
 
   // Base URL
   shouldShowSpeedTest: boolean;
@@ -134,6 +138,7 @@ export function CodexFormFields({
   category,
   shouldShowApiKeyLink,
   websiteUrl,
+  isKiroPreset,
   isPartner,
   partnerPromotionKey,
   shouldShowSpeedTest,
@@ -251,6 +256,30 @@ export function CodexFormFields({
   );
 
   const handleFetchModels = useCallback(() => {
+    const onModels = (models: typeof fetchedModels) => {
+      setFetchedModels(models);
+      if (models.length === 0) {
+        toast.info(t("providerForm.fetchModelsEmpty"));
+      } else {
+        toast.success(
+          t("providerForm.fetchModelsSuccess", { count: models.length }),
+        );
+      }
+    };
+
+    // Kiro：用 CodeWhisperer ListAvailableModels，而非 base_url/v1/models
+    if (isKiroPreset) {
+      setIsFetchingModels(true);
+      kiroListModels()
+        .then(onModels)
+        .catch((err) => {
+          console.warn("[Kiro] Failed to fetch models:", err);
+          showFetchModelsError(err, t);
+        })
+        .finally(() => setIsFetchingModels(false));
+      return;
+    }
+
     if (!codexBaseUrl || !codexApiKey) {
       showFetchModelsError(null, t, {
         hasApiKey: !!codexApiKey,
@@ -266,22 +295,13 @@ export function CodexFormFields({
       undefined,
       customUserAgent,
     )
-      .then((models) => {
-        setFetchedModels(models);
-        if (models.length === 0) {
-          toast.info(t("providerForm.fetchModelsEmpty"));
-        } else {
-          toast.success(
-            t("providerForm.fetchModelsSuccess", { count: models.length }),
-          );
-        }
-      })
+      .then(onModels)
       .catch((err) => {
         console.warn("[ModelFetch] Failed:", err);
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [codexBaseUrl, codexApiKey, isFullUrl, customUserAgent, t]);
+  }, [codexBaseUrl, codexApiKey, isFullUrl, customUserAgent, isKiroPreset, t]);
 
   const handleAddCatalogRow = useCallback(() => {
     if (!onCatalogModelsChange) return;
@@ -333,26 +353,31 @@ export function CodexFormFields({
 
   return (
     <>
+      {/* Kiro (Amazon Q / CodeWhisperer) 凭证继承 */}
+      {isKiroPreset && <KiroAuthSection />}
+
       {/* Codex API Key 输入框 */}
-      <ApiKeySection
-        id="codexApiKey"
-        label="API Key"
-        value={codexApiKey}
-        onChange={onApiKeyChange}
-        category={category}
-        shouldShowLink={shouldShowApiKeyLink}
-        websiteUrl={websiteUrl}
-        isPartner={isPartner}
-        partnerPromotionKey={partnerPromotionKey}
-        placeholder={{
-          official: t("providerForm.codexOfficialNoApiKey", {
-            defaultValue: "官方供应商无需 API Key",
-          }),
-          thirdParty: t("providerForm.codexApiKeyAutoFill", {
-            defaultValue: "输入 API Key，将自动填充到配置",
-          }),
-        }}
-      />
+      {!isKiroPreset && (
+        <ApiKeySection
+          id="codexApiKey"
+          label="API Key"
+          value={codexApiKey}
+          onChange={onApiKeyChange}
+          category={category}
+          shouldShowLink={shouldShowApiKeyLink}
+          websiteUrl={websiteUrl}
+          isPartner={isPartner}
+          partnerPromotionKey={partnerPromotionKey}
+          placeholder={{
+            official: t("providerForm.codexOfficialNoApiKey", {
+              defaultValue: "官方供应商无需 API Key",
+            }),
+            thirdParty: t("providerForm.codexApiKeyAutoFill", {
+              defaultValue: "输入 API Key，将自动填充到配置",
+            }),
+          }}
+        />
+      )}
 
       {/* Codex Base URL 输入框 */}
       {shouldShowSpeedTest && (

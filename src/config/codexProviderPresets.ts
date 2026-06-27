@@ -36,6 +36,10 @@ export interface CodexProviderPreset {
   modelCatalog?: CodexCatalogModel[];
   // Codex Responses -> Chat Completions reasoning capability defaults
   codexChatReasoning?: CodexChatReasoning;
+  // 供应商类型标识（特殊供应商检测）。"kiro" = Amazon Q / CodeWhisperer。
+  providerType?: "kiro";
+  // 是否需要 OAuth / 继承凭证（而非 API Key）
+  requiresOAuth?: boolean;
 }
 
 /**
@@ -100,6 +104,30 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     },
     icon: "openai",
     iconColor: "#00A67E",
+  },
+  {
+    name: "Kiro (Amazon Q)",
+    websiteUrl: "https://kiro.dev",
+    providerType: "kiro",
+    requiresOAuth: true,
+    category: "third_party",
+    // 继承 kiro-cli 登录，无需 API Key（占位即可）
+    auth: { OPENAI_API_KEY: "kiro" },
+    // base_url 仅占位；Kiro 请求由本地代理拦截改走 CodeWhisperer。
+    // clash 等上游代理请在 cc-switch「全局代理」中设置（如 http://127.0.0.1:7897）。
+    config: `model_provider = "kiro"
+model = "claude-sonnet-4.6"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.kiro]
+name = "Kiro (Amazon Q)"
+base_url = "https://codewhisperer.us-east-1.amazonaws.com"
+wire_api = "responses"
+requires_openai_auth = true`,
+    apiFormat: "openai_responses",
+    icon: "generic",
+    iconColor: "#7C3AED",
   },
   {
     name: "Shengsuanyun",

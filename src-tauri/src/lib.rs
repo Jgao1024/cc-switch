@@ -989,6 +989,17 @@ pub fn run() {
                 log::info!("✓ CodexOAuthManager initialized");
             }
 
+            // 初始化 KiroAuthManager (Amazon Q / CodeWhisperer)
+            {
+                use crate::proxy::providers::kiro_auth::KiroAuthManager;
+                use commands::kiro::KiroAuthState;
+
+                // 代理地址在请求时由 provider 配置注入（set_proxy），此处先建直连实例。
+                let kiro_auth_manager = KiroAuthManager::new(None);
+                app.manage(KiroAuthState(Arc::new(kiro_auth_manager)));
+                log::info!("✓ KiroAuthManager initialized");
+            }
+
             // 初始化全局出站代理 HTTP 客户端
             {
                 let db = &app.state::<AppState>().db;
@@ -1475,6 +1486,10 @@ pub fn run() {
             commands::copilot_get_models_for_account,
             commands::copilot_get_usage,
             commands::copilot_get_usage_for_account,
+            // Kiro (Amazon Q / CodeWhisperer) commands
+            commands::kiro_has_cli_credentials,
+            commands::kiro_is_authenticated,
+            commands::kiro_prefetch_profile,
             // OMO commands
             commands::read_omo_local_file,
             commands::get_current_omo_provider_id,

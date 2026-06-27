@@ -23,7 +23,7 @@ use super::{
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
-        transform_codex_chat, transform_gemini, transform_responses,
+        transform_codex_chat, transform_gemini, transform_kiro, transform_responses,
     },
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
@@ -184,6 +184,12 @@ async fn handle_messages_for_app(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
+    // Kiro (Amazon Q / CodeWhisperer) 供应商：不走通用透传转发，使用专用
+    // CodeWhisperer 协议转换 handler（请求 Anthropic→CW，响应 event-stream→SSE）。
+    if let Some(provider) = ctx.get_providers().into_iter().find(provider_is_kiro) {
+        return handle_kiro_messages(&state, &body, provider, is_stream).await;
+    }
+
     // 转发请求
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -245,6 +251,101 @@ async fn handle_messages_for_app(
         connection_guard,
     )
     .await
+}
+
+// ============================================================================
+// Kiro (Amazon Q / CodeWhisperer) 专用 handler
+// ============================================================================
+
+/// 判断 provider 是否为 Kiro 类型（meta.provider_type == "kiro"）
+fn provider_is_kiro(provider: &crate::provider::Provider) -> bool {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|m| m.provider_type.as_deref())
+        == Some("kiro")
+}
+
+/// 从 Kiro provider 配置解析上游代理地址（如 clash `http://127.0.0.1:7897`）。
+fn kiro_upstream_proxy(provider: &crate::provider::Provider) -> Option<String> {
+    for key in ["upstreamProxy", "proxyUrl", "upstream_proxy", "proxy_url"] {
+        if let Some(v) = provider
+            .settings_config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Kiro 供应商请求处理：Anthropic `/v1/messages` → CodeWhisperer，
+/// 响应 event-stream → Anthropic SSE（或非流式聚合为 Anthropic JSON）。
+async fn handle_kiro_messages(
+    state: &ProxyState,
+    body: &Value,
+    provider: crate::provider::Provider,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    use tauri::Manager;
+
+    let app_handle = state
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| ProxyError::Internal("Kiro 认证不可用（无 AppHandle）".to_string()))?;
+    let kiro_state = app_handle.state::<crate::commands::kiro::KiroAuthState>();
+    let manager = kiro_state.0.clone();
+    manager.set_proxy(kiro_upstream_proxy(&provider));
+
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let cw_body = transform_kiro::anthropic_to_cw_request(body);
+
+    let resp = manager
+        .send_generate_assistant_response(cw_body)
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ProxyError::UpstreamError {
+            status: status.as_u16(),
+            body: Some(text.chars().take(2000).collect()),
+        });
+    }
+
+    if is_stream {
+        let upstream = resp.bytes_stream();
+        let sse_stream =
+            transform_kiro::create_anthropic_sse_stream_from_kiro(upstream, model);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+        let resp_body = axum::body::Body::from_stream(sse_stream);
+        return Ok((headers, resp_body).into_response());
+    }
+
+    // 非流式：缓冲全部字节，解码后聚合为单个 Anthropic JSON。
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ProxyError::Internal(format!("读取 Kiro 响应失败: {e}")))?;
+    let mut decoder = transform_kiro::EventStreamDecoder::new();
+    let events = decoder.push(&bytes);
+    let message = transform_kiro::cw_events_to_anthropic_message(&events, model.as_deref());
+    Ok((StatusCode::OK, Json(message)).into_response())
 }
 
 fn validate_claude_desktop_gateway_auth(

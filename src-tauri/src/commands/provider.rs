@@ -454,6 +454,76 @@ fn resolve_coding_plan_credentials(
     }
 }
 
+/// 查询 Kiro（CodeWhisperer）套餐额度，转换为 `UsageResult`（与余额查询统一格式，
+/// 可直接在供应商列表展示）。用本地 kiro-cli 凭证，proxy 优先取 provider 配置，
+/// 缺省回退全局出站代理。
+async fn query_kiro_usage_limits(
+    state: &AppState,
+    provider: Option<&Provider>,
+) -> crate::provider::UsageResult {
+    use crate::proxy::providers::kiro_auth::KiroAuthManager;
+
+    // provider 配置的上游代理键（与 kiro_handler 保持一致）
+    let proxy = provider
+        .and_then(|p| {
+            ["upstreamProxy", "proxyUrl", "upstream_proxy", "proxy_url"]
+                .iter()
+                .find_map(|key| {
+                    p.settings_config
+                        .get(*key)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+        })
+        .or_else(|| state.db.get_global_proxy_url().ok().flatten());
+
+    let mgr = KiroAuthManager::new(proxy);
+    match mgr.get_usage_limits().await {
+        Ok(limits) => {
+            let used = limits.current_usage;
+            let total = limits.usage_limit;
+            let remaining = (total - used).max(0.0);
+            let unit = limits
+                .display_name_plural
+                .clone()
+                .unwrap_or_else(|| "Credits".to_string());
+            // 下次重置时间（Unix 秒 → 本地日期）
+            let extra = limits.next_date_reset.and_then(|ts| {
+                use chrono::TimeZone;
+                chrono::Local
+                    .timestamp_opt(ts as i64, 0)
+                    .single()
+                    .map(|dt| format!("Reset: {}", dt.format("%Y-%m-%d")))
+            });
+            crate::provider::UsageResult {
+                success: true,
+                data: Some(vec![crate::provider::UsageData {
+                    plan_name: limits.plan_title.or_else(|| Some("Kiro".to_string())),
+                    remaining: Some(remaining),
+                    total: Some(total),
+                    used: Some(used),
+                    unit: Some(unit),
+                    is_valid: Some(remaining > 0.0),
+                    invalid_message: if remaining > 0.0 {
+                        None
+                    } else {
+                        Some("No credits remaining".to_string())
+                    },
+                    extra,
+                }]),
+                error: None,
+            }
+        }
+        Err(e) => crate::provider::UsageResult {
+            success: false,
+            data: None,
+            error: Some(format!("Failed to query Kiro usage: {e}")),
+        },
+    }
+}
+
 async fn query_provider_usage_inner(
     state: &AppState,
     copilot_state: &CopilotAuthState,
@@ -472,6 +542,17 @@ async fn query_provider_usage_inner(
     let template_type = usage_script
         .and_then(|s| s.template_type.as_deref())
         .unwrap_or("");
+
+    // ── Kiro 套餐额度查询路径（CodeWhisperer GetUsageLimits）──
+    // kiro 用本地 kiro-cli 凭证，不走 base_url/api_key 余额检测；
+    // 优先用 provider 配置的上游代理，缺省回退全局出站代理。
+    let is_kiro = provider
+        .and_then(|p| p.meta.as_ref())
+        .and_then(|m| m.provider_type.as_deref())
+        == Some("kiro");
+    if is_kiro {
+        return Ok(query_kiro_usage_limits(state, provider).await);
+    }
 
     // ── GitHub Copilot 专用路径 ──
     if template_type == TEMPLATE_TYPE_GITHUB_COPILOT {

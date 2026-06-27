@@ -152,19 +152,34 @@ pub struct RequestLogDetail {
     /// 写入时实际用于计价的模型名。None = v11 前的历史行，"" = 未计价的错误行。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
+    /// 脱敏后的原始客户端请求头（JSON 对象字符串）。列表查询为 None，仅详情返回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<String>,
+    /// 原始客户端请求体（JSON 文本）。列表查询为 None，仅详情返回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    /// 转接后实际发往上游的请求体（如 kiro 的 CodeWhisperer body）。仅详情返回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_request_body: Option<String>,
+    /// kiro 套餐消耗的 credits（meteringEvent 累计）。非 kiro 行为 "0"/None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<String>,
 }
 
-/// 把 25 列的查询结果映射为 `RequestLogDetail`。
+/// 把 29 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 25 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 29 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
 ///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
 ///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model`
+///  data_source, pricing_model, request_headers, request_body,
+///  upstream_request_body, credits`
 ///
-/// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
+/// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可；
+/// 列表查询同理用 `NULL` 占位 request_headers/request_body/upstream_request_body
+/// 以避免传输大字段，仅详情查询返回真实值。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
     Ok(RequestLogDetail {
         request_id: row.get(0)?,
@@ -194,6 +209,10 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         created_at: row.get(22)?,
         data_source: row.get(23)?,
         pricing_model: row.get(24)?,
+        request_headers: row.get(25)?,
+        request_body: row.get(26)?,
+        upstream_request_body: row.get(27)?,
+        credits: row.get(28)?,
     })
 }
 
@@ -1526,7 +1545,8 @@ impl Database {
                     l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
-                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model
+                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
+                    NULL AS request_headers, NULL AS request_body, NULL AS upstream_request_body, l.credits
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1569,7 +1589,8 @@ impl Database {
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model
+                    status_code, error_message, created_at, l.data_source, l.pricing_model,
+                    l.request_headers, l.request_body, l.upstream_request_body, l.credits
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1725,7 +1746,9 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model
+                        data_source, pricing_model,
+                        NULL AS request_headers, NULL AS request_body,
+                        NULL AS upstream_request_body, NULL AS credits
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0

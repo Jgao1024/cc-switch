@@ -218,6 +218,9 @@ export function ProviderCard({
     appId === "hermes" && isHermesReadOnlyProvider(provider.settingsConfig);
   const isCodexOauth =
     provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH;
+  // Kiro（Amazon Q / CodeWhisperer）：复用本机 kiro-cli 凭证，套餐额度经
+  // GetUsageLimits 查询，像 OpenRouter 一样在列表内联展示，无需配置用量脚本。
+  const isKiro = provider.meta?.providerType === PROVIDER_TYPES.KIRO;
   const codexNeedsRouting = useMemo(() => {
     if (appId !== "codex" || provider.category === "official") return false;
     if (provider.meta?.apiFormat === "openai_chat") return true;
@@ -505,7 +508,7 @@ export function ProviderCard({
                   provider={provider}
                   providerId={provider.id}
                   appId={appId}
-                  usageEnabled={usageEnabled}
+                  usageEnabled={usageEnabled || isKiro}
                   isCurrent={isCurrent}
                   isInConfig={isInConfig}
                   inline={true}

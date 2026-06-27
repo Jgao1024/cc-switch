@@ -34,6 +34,14 @@ export interface RequestLog {
   errorMessage?: string;
   createdAt: number;
   dataSource?: string;
+  /** kiro 套餐消耗的 credits（meteringEvent 累计）；非 kiro 行为 "0"/缺省 */
+  credits?: string;
+  /** 脱敏后的原始客户端请求头（JSON 对象字符串）。仅详情查询返回 */
+  requestHeaders?: string;
+  /** 原始客户端请求体（JSON 文本）。仅详情查询返回 */
+  requestBody?: string;
+  /** 转接后实际发往上游的请求体（如 kiro 的 CodeWhisperer body）。仅详情查询返回 */
+  upstreamRequestBody?: string;
 }
 
 export interface SessionSyncResult {

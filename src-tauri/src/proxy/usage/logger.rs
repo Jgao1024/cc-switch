@@ -34,6 +34,14 @@ pub struct RequestLog {
     pub is_streaming: bool,
     /// 成本倍数
     pub cost_multiplier: String,
+    /// 原始客户端请求头（脱敏后的 JSON 对象字符串）。None 表示未采集。
+    pub request_headers: Option<String>,
+    /// 原始客户端请求体（JSON 文本）。None 表示未采集。
+    pub request_body: Option<String>,
+    /// 转接后实际发往上游的请求体（如 kiro 的 CodeWhisperer body）。None 表示未采集。
+    pub upstream_request_body: Option<String>,
+    /// kiro 套餐消耗的 credits（meteringEvent 累计）；非 kiro 为 "0"。
+    pub credits: String,
 }
 
 /// 使用量记录器
@@ -77,8 +85,9 @@ impl<'a> UsageLogger<'a> {
                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                 latency_ms, first_token_ms, status_code, error_message, session_id,
-                provider_type, is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                provider_type, is_streaming, cost_multiplier, created_at,
+                request_headers, request_body, upstream_request_body, credits
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             rusqlite::params![
                 log.request_id,
                 log.provider_id,
@@ -104,6 +113,10 @@ impl<'a> UsageLogger<'a> {
                 log.is_streaming as i64,
                 log.cost_multiplier,
                 created_at,
+                log.request_headers,
+                log.request_body,
+                log.upstream_request_body,
+                log.credits,
             ],
         )
         .map_err(|e| AppError::Database(format!("记录请求日志失败: {e}")))?;
@@ -147,6 +160,10 @@ impl<'a> UsageLogger<'a> {
             provider_type: None,
             is_streaming: false,
             cost_multiplier: "1.0".to_string(),
+            request_headers: None,
+            request_body: None,
+            upstream_request_body: None,
+            credits: "0".to_string(),
         };
 
         self.log_request(&log)
@@ -188,6 +205,10 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: "1.0".to_string(),
+            request_headers: None,
+            request_body: None,
+            upstream_request_body: None,
+            credits: "0".to_string(),
         };
 
         self.log_request(&log)
@@ -356,9 +377,85 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: cost_multiplier.to_string(),
+            request_headers: None,
+            request_body: None,
+            upstream_request_body: None,
+            credits: "0".to_string(),
         };
 
         self.log_request(&log)
+    }
+
+    /// 记录 kiro（CodeWhisperer / 套餐）请求。
+    ///
+    /// kiro 是套餐计费：不按 token 价格折算 USD（`total_cost_usd` 记 0），
+    /// 用量以 `credits`（meteringEvent 累计）为准；token 为本地估算值。
+    /// 同时落库原始/转接后的请求头与请求体明细。
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_kiro(
+        &self,
+        request_id: String,
+        provider_id: String,
+        app_type: String,
+        model: String,
+        input_tokens: u32,
+        output_tokens: u32,
+        credits: f64,
+        latency_ms: u64,
+        first_token_ms: Option<u64>,
+        status_code: u16,
+        session_id: Option<String>,
+        is_streaming: bool,
+        request_headers: Option<String>,
+        request_body: Option<String>,
+        upstream_request_body: Option<String>,
+    ) -> Result<(), AppError> {
+        let usage = TokenUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: Some(model.clone()),
+            message_id: None,
+        };
+        let log = RequestLog {
+            request_id,
+            provider_id,
+            app_type,
+            model: model.clone(),
+            request_model: model,
+            // 套餐无 token 计价，pricing_model 留空（不参与 USD 计价/回填）
+            pricing_model: String::new(),
+            usage,
+            cost: None,
+            latency_ms,
+            first_token_ms,
+            status_code,
+            error_message: None,
+            session_id,
+            provider_type: Some("kiro".to_string()),
+            is_streaming,
+            cost_multiplier: "1.0".to_string(),
+            request_headers,
+            request_body,
+            upstream_request_body,
+            credits: format_credits(credits),
+        };
+        self.log_request(&log)
+    }
+}
+
+/// 将 credits 浮点值格式化为稳定的十进制字符串（最多 6 位小数，去尾零）。
+fn format_credits(credits: f64) -> String {
+    if credits <= 0.0 {
+        return "0".to_string();
+    }
+    let s = format!("{credits:.6}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 

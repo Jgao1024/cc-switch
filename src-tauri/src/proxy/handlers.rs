@@ -192,7 +192,14 @@ async fn handle_messages_for_app(
         .into_iter()
         .find(kiro_handler::provider_is_kiro)
     {
-        return kiro_handler::handle_kiro_messages(&state, &body, provider, is_stream).await;
+        let log_ctx = kiro_handler::KiroLogContext::new(
+            app_type_str,
+            Some(ctx.session_id.clone()),
+            &headers,
+            &body,
+        );
+        return kiro_handler::handle_kiro_messages(&state, &body, provider, is_stream, log_ctx)
+            .await;
     }
 
     // 转发请求
@@ -660,7 +667,14 @@ pub async fn handle_chat_completions(
         .into_iter()
         .find(kiro_handler::provider_is_kiro)
     {
-        return kiro_handler::handle_kiro_openai_chat(&state, &body, provider, is_stream).await;
+        let log_ctx = kiro_handler::KiroLogContext::new(
+            "codex",
+            Some(ctx.session_id.clone()),
+            &headers,
+            &body,
+        );
+        return kiro_handler::handle_kiro_openai_chat(&state, &body, provider, is_stream, log_ctx)
+            .await;
     }
 
     let forwarder = ctx.create_forwarder(&state);
@@ -735,8 +749,20 @@ pub async fn handle_responses(
         .into_iter()
         .find(kiro_handler::provider_is_kiro)
     {
-        return kiro_handler::handle_kiro_responses(&state, &body, provider, codex_tool_context)
-            .await;
+        let log_ctx = kiro_handler::KiroLogContext::new(
+            "codex",
+            Some(ctx.session_id.clone()),
+            &headers,
+            &body,
+        );
+        return kiro_handler::handle_kiro_responses(
+            &state,
+            &body,
+            provider,
+            codex_tool_context,
+            log_ctx,
+        )
+        .await;
     }
 
     let forwarder = ctx.create_forwarder(&state);

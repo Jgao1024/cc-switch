@@ -195,7 +195,9 @@ impl Database {
             duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
-            data_source TEXT NOT NULL DEFAULT 'proxy'
+            data_source TEXT NOT NULL DEFAULT 'proxy',
+            request_headers TEXT, request_body TEXT, upstream_request_body TEXT,
+            credits TEXT NOT NULL DEFAULT '0'
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -443,6 +445,11 @@ impl Database {
                         log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
+                    }
+                    11 => {
+                        log::info!("迁移数据库从 v11 到 v12（proxy_request_logs 增加请求头/体明细与 credits 列）");
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1267,6 +1274,33 @@ impl Database {
         log::info!(
             "v10 -> v11 迁移完成：usage_daily_rollups 已保留 request_model/pricing_model 维度"
         );
+        Ok(())
+    }
+
+    /// v11 -> v12 迁移：proxy_request_logs 增加请求明细（原始/转接后请求头与体）
+    /// 以及 kiro 套餐 credits 列。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            // 原始客户端请求头（脱敏后的 JSON 对象）
+            Self::add_column_if_missing(conn, "proxy_request_logs", "request_headers", "TEXT")?;
+            // 原始客户端请求体（JSON 文本）
+            Self::add_column_if_missing(conn, "proxy_request_logs", "request_body", "TEXT")?;
+            // 转接后实际发往上游的请求体（如 kiro 的 CodeWhisperer body）
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "upstream_request_body",
+                "TEXT",
+            )?;
+            // kiro 套餐消耗的 credits（meteringEvent 累计），字符串十进制，默认 '0'
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "credits",
+                "TEXT NOT NULL DEFAULT '0'",
+            )?;
+        }
+        log::info!("v11 -> v12 迁移完成：proxy_request_logs 已增加请求明细与 credits 列");
         Ok(())
     }
 

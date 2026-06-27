@@ -65,6 +65,106 @@ impl DecodedEvent {
     }
 }
 
+// ===================================================================
+// Part A2: 用量 / credits 提取（meteringEvent + 本地 token 估算）
+// ===================================================================
+
+/// 极简 token 估算：按字符数 / 4 粗估（向上取整）。
+///
+/// CodeWhisperer 流式响应不回传 token 用量（实测仅 assistantResponseEvent /
+/// toolUseEvent / contextUsageEvent / meteringEvent），故只能本地估算，用于在
+/// 使用统计里给出量级参考，不追求精确。
+pub fn estimate_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    chars.div_ceil(4)
+}
+
+/// 递归累加 JSON 中所有字符串值的估算 token 数（不计 key），用于从请求体粗估
+/// 输入 token。覆盖 system / messages.content / tool 描述等所有文本。
+pub fn estimate_tokens_in_value(v: &Value) -> u64 {
+    match v {
+        Value::String(s) => estimate_tokens(s),
+        Value::Array(arr) => arr.iter().map(estimate_tokens_in_value).sum(),
+        Value::Object(map) => map.values().map(estimate_tokens_in_value).sum(),
+        _ => 0,
+    }
+}
+
+/// 从 kiro（CodeWhisperer）响应事件中提取的用量信息。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KiroUsage {
+    /// meteringEvent 累计消耗的 credits（一次响应内可能有多个 metering 事件，累加）。
+    pub credits: f64,
+    /// 估算的输出 token（由 assistantResponseEvent / toolUseEvent 文本估算）。
+    pub output_tokens: u64,
+    /// 最后一次 contextUsageEvent 的上下文占用百分比（0~1）。
+    pub context_usage_pct: Option<f64>,
+}
+
+/// 增量累计 kiro 响应用量，供流式与非流式共用。
+///
+/// 流式：每解码出一个事件调用 [`observe`](Self::observe)，流结束后读 [`finish`](Self::finish)。
+/// 非流式：把全部事件逐个 observe 即可。
+#[derive(Debug, Default)]
+pub struct KiroUsageAccumulator {
+    credits: f64,
+    output_text_len: usize,
+    context_usage_pct: Option<f64>,
+}
+
+impl KiroUsageAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 观察一个已解码事件，累加 credits / 输出文本 / 上下文占用。
+    pub fn observe(&mut self, ev: &DecodedEvent) {
+        let Some(j) = ev.json() else { return };
+        match ev.event_type.as_str() {
+            "assistantResponseEvent" => {
+                if let Some(c) = j.get("content").and_then(|c| c.as_str()) {
+                    self.output_text_len += c.chars().count();
+                }
+            }
+            "toolUseEvent" => {
+                // 工具调用的 input 分片也计入输出文本量
+                if let Some(inp) = j.get("input").and_then(|i| i.as_str()) {
+                    self.output_text_len += inp.chars().count();
+                }
+            }
+            "meteringEvent" => {
+                if let Some(u) = j.get("usage").and_then(|u| u.as_f64()) {
+                    self.credits += u;
+                }
+            }
+            "contextUsageEvent" => {
+                if let Some(p) = j.get("contextUsagePercentage").and_then(|p| p.as_f64()) {
+                    self.context_usage_pct = Some(p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 结算累计用量。
+    pub fn finish(&self) -> KiroUsage {
+        KiroUsage {
+            credits: self.credits,
+            output_tokens: (self.output_text_len as u64).div_ceil(4),
+            context_usage_pct: self.context_usage_pct,
+        }
+    }
+}
+
+/// 一次性从全部事件提取用量（非流式便捷入口）。
+pub fn extract_kiro_usage(events: &[DecodedEvent]) -> KiroUsage {
+    let mut acc = KiroUsageAccumulator::new();
+    for ev in events {
+        acc.observe(ev);
+    }
+    acc.finish()
+}
+
 /// 增量式 event-stream 解码器。
 ///
 /// 帧格式（大端）：
@@ -695,15 +795,54 @@ pub fn cw_events_to_anthropic_message(events: &[DecodedEvent], model: Option<&st
 use bytes::Bytes;
 use futures::Stream;
 
+/// 流结束（或被取消 drop）时结算 kiro 用量并触发回调的守卫。
+///
+/// 用 `Arc<Mutex<..>>` 与流体共享累加器：流每解码一个事件就 `observe`，
+/// 守卫在 drop 时 `finish` 并回调。即便客户端中途断开导致流被 drop，
+/// 也能保证用量被记录一次（回调内部自行 `tokio::spawn` 落库）。
+pub struct KiroUsageGuard {
+    acc: std::sync::Arc<std::sync::Mutex<KiroUsageAccumulator>>,
+    cb: Option<Box<dyn FnOnce(KiroUsage) + Send>>,
+}
+
+impl KiroUsageGuard {
+    fn new(cb: Box<dyn FnOnce(KiroUsage) + Send>) -> Self {
+        Self {
+            acc: std::sync::Arc::new(std::sync::Mutex::new(KiroUsageAccumulator::new())),
+            cb: Some(cb),
+        }
+    }
+
+    fn observe(&self, ev: &DecodedEvent) {
+        if let Ok(mut acc) = self.acc.lock() {
+            acc.observe(ev);
+        }
+    }
+}
+
+impl Drop for KiroUsageGuard {
+    fn drop(&mut self) {
+        if let Some(cb) = self.cb.take() {
+            let usage = self.acc.lock().map(|a| a.finish()).unwrap_or_default();
+            cb(usage);
+        }
+    }
+}
+
 /// 将上游 CodeWhisperer event-stream 字节流转换为 Anthropic SSE 字节流。
 ///
 /// 入参为 `reqwest::Response::bytes_stream()`，出参可直接喂给
 /// `create_logged_passthrough_stream` / `axum::body::Body::from_stream`。
+///
+/// `on_complete`：流结束（含客户端断开）时回调累计用量（credits + 估算输出 token），
+/// 由调用方负责落库。
 pub fn create_anthropic_sse_stream_from_kiro(
     upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: Option<String>,
+    on_complete: Box<dyn FnOnce(KiroUsage) + Send>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let usage_guard = KiroUsageGuard::new(on_complete);
         let mut decoder = EventStreamDecoder::new();
         let mut conv = KiroToAnthropic::new(model.as_deref());
         futures::pin_mut!(upstream);
@@ -712,6 +851,7 @@ pub fn create_anthropic_sse_stream_from_kiro(
             match item {
                 Ok(bytes) => {
                     for ev in decoder.push(&bytes) {
+                        usage_guard.observe(&ev);
                         // 异常事件：转成 Anthropic error 事件后结束
                         if ev.message_type.as_deref() == Some("exception") {
                             let msg = ev
@@ -1068,11 +1208,15 @@ impl KiroToOpenAIChat {
 }
 
 /// CW 字节流 → OpenAI Chat Completions SSE 字节流。
+///
+/// `on_complete`：流结束（含客户端断开）时回调累计用量，由调用方落库。
 pub fn create_openai_sse_stream_from_kiro(
     upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: Option<String>,
+    on_complete: Box<dyn FnOnce(KiroUsage) + Send>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let usage_guard = KiroUsageGuard::new(on_complete);
         let mut decoder = EventStreamDecoder::new();
         let mut conv = KiroToOpenAIChat::new(model.as_deref());
         futures::pin_mut!(upstream);
@@ -1081,6 +1225,7 @@ pub fn create_openai_sse_stream_from_kiro(
             match item {
                 Ok(bytes) => {
                     for ev in decoder.push(&bytes) {
+                        usage_guard.observe(&ev);
                         if ev.message_type.as_deref() == Some("exception") {
                             let msg = ev
                                 .json()
@@ -1245,6 +1390,57 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "a");
         assert_eq!(events[1].event_type, "b");
+    }
+
+    // ---- 用量 / credits 提取 ----
+
+    #[test]
+    fn test_extract_kiro_usage_sums_metering_and_estimates_output() {
+        let mut buf = make_frame(
+            "assistantResponseEvent",
+            br#"{"content":"Hello world","modelId":"claude-sonnet-4.6"}"#,
+        );
+        buf.extend(make_frame(
+            "assistantResponseEvent",
+            br#"{"content":"!!","modelId":"claude-sonnet-4.6"}"#,
+        ));
+        buf.extend(make_frame(
+            "contextUsageEvent",
+            br#"{"contextUsagePercentage":0.41}"#,
+        ));
+        // 两个 meteringEvent 必须累加（工具调用多轮场景）
+        buf.extend(make_frame(
+            "meteringEvent",
+            br#"{"unit":"credit","usage":0.01}"#,
+        ));
+        buf.extend(make_frame(
+            "meteringEvent",
+            br#"{"unit":"credit","usage":0.02}"#,
+        ));
+
+        let mut dec = EventStreamDecoder::new();
+        let events = dec.push(&buf);
+        let usage = extract_kiro_usage(&events);
+
+        // credits 累加：0.01 + 0.02
+        assert!(
+            (usage.credits - 0.03).abs() < 1e-9,
+            "credits={}",
+            usage.credits
+        );
+        // 输出文本 "Hello world" + "!!" = 13 字符 → ceil(13/4)=4
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.context_usage_pct, Some(0.41));
+    }
+
+    #[test]
+    fn test_estimate_tokens_in_value_walks_strings() {
+        let v = json!({
+            "system": "abcd",            // 4 chars → 1
+            "messages": [{"content": "abcdefgh"}], // 8 chars → 2
+            "ignored_number": 12345
+        });
+        assert_eq!(estimate_tokens_in_value(&v), 3);
     }
 
     // ---- 请求转换 ----

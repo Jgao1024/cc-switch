@@ -25,6 +25,8 @@ pub mod protocol {
     pub const TARGET_LIST_PROFILES: &str = "AmazonCodeWhispererService.ListAvailableProfiles";
     /// 列出可用模型
     pub const TARGET_LIST_MODELS: &str = "AmazonCodeWhispererService.ListAvailableModels";
+    /// 查询套餐用量额度（credits 已用 / 上限）
+    pub const TARGET_GET_USAGE_LIMITS: &str = "AmazonCodeWhispererService.GetUsageLimits";
     /// 流式聊天操作
     pub const TARGET_GENERATE_ASSISTANT_RESPONSE: &str =
         "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
@@ -42,6 +44,21 @@ pub mod protocol {
 
     /// 后端默认模型标识（响应中回传的 modelId）
     pub const DEFAULT_MODEL_ID: &str = "claude-sonnet-4.6";
+}
+
+/// kiro 套餐用量额度（来自 `GetUsageLimits`）。
+#[derive(Debug, Clone)]
+pub struct KiroUsageLimits {
+    /// 套餐标题，如 "KIRO PRO MAX"。
+    pub plan_title: Option<String>,
+    /// 已用额度（credits）。
+    pub current_usage: f64,
+    /// 额度上限（credits）。
+    pub usage_limit: f64,
+    /// 单位复数名，如 "Credits"。
+    pub display_name_plural: Option<String>,
+    /// 下次重置时间（Unix 秒，浮点）。
+    pub next_date_reset: Option<f64>,
 }
 
 /// kiro-cli 凭证（从其 SQLite auth_kv 表继承的字段子集）
@@ -427,8 +444,78 @@ impl KiroAuthManager {
         Ok(out)
     }
 
-    /// 发送 `GenerateAssistantResponse` 流式聊天请求。
+    /// 查询套餐用量额度（credits 已用 / 上限）。
     ///
+    /// 调用 `GetUsageLimits`（body 仅需 `profileArn`），解析 `usageBreakdownList[0]`
+    /// 与 `subscriptionInfo`。实测返回示例见 `docs/kiro-cli-auth-and-api.md`。
+    pub async fn get_usage_limits(&self) -> Result<KiroUsageLimits, KiroAuthError> {
+        let token = self.get_valid_token().await?;
+        let arn = self.get_profile_arn().await?;
+        let client = self.http_client()?;
+        let resp = client
+            .post(protocol::CW_ENDPOINT)
+            .header("Content-Type", protocol::CONTENT_TYPE_AMZ_JSON)
+            .header("X-Amz-Target", protocol::TARGET_GET_USAGE_LIMITS)
+            .header("Authorization", format!("Bearer {token}"))
+            .header(protocol::HEADER_OPTOUT, "true")
+            .body(json!({ "profileArn": arn }).to_string())
+            .send()
+            .await
+            .map_err(|e| KiroAuthError::Network(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| KiroAuthError::Network(e.to_string()))?;
+        if !status.is_success() {
+            return Err(KiroAuthError::Network(format!(
+                "GetUsageLimits HTTP {status}: {}",
+                text.chars().take(300).collect::<String>()
+            )));
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| KiroAuthError::Network(e.to_string()))?;
+
+        let plan_title = v
+            .pointer("/subscriptionInfo/subscriptionTitle")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+
+        let breakdown = v
+            .get("usageBreakdownList")
+            .and_then(|l| l.as_array())
+            .and_then(|arr| arr.first());
+
+        // 优先取高精度字段，回退整数字段
+        let pick = |obj: Option<&serde_json::Value>, hi: &str, lo: &str| -> f64 {
+            obj.and_then(|b| {
+                b.get(hi)
+                    .and_then(|x| x.as_f64())
+                    .or_else(|| b.get(lo).and_then(|x| x.as_f64()))
+            })
+            .unwrap_or(0.0)
+        };
+        let current_usage = pick(breakdown, "currentUsageWithPrecision", "currentUsage");
+        let usage_limit = pick(breakdown, "usageLimitWithPrecision", "usageLimit");
+        let display_name_plural = breakdown
+            .and_then(|b| b.get("displayNamePlural"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let next_date_reset = breakdown
+            .and_then(|b| b.get("nextDateReset"))
+            .and_then(|x| x.as_f64())
+            .or_else(|| v.get("nextDateReset").and_then(|x| x.as_f64()));
+
+        Ok(KiroUsageLimits {
+            plan_title,
+            current_usage,
+            usage_limit,
+            display_name_plural,
+            next_date_reset,
+        })
+    }
+
+    /// 发送 `GenerateAssistantResponse` 流式聊天请求。    ///
     /// `cw_body` 为 `transform_kiro::anthropic_to_cw_request` 等产出的请求体
     /// （含 `conversationState`，不含 `profileArn`）。本方法自动注入有效 token、
     /// profileArn 与必需头部，经配置的上游代理发送，返回流式 `reqwest::Response`。
@@ -547,5 +634,62 @@ mod tests {
         println!("[live] models = {ids:?}");
         assert!(ids.iter().any(|m| m.contains("sonnet-4.6")));
         assert!(ids.iter().any(|m| m.contains("opus-4.8")));
+    }
+
+    /// 临时：转储完整 CW 事件流，定位 credits / token 用量字段。
+    /// 运行：`cargo test --lib proxy::providers::kiro_auth::tests::live_dump_full_event_stream -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_dump_full_event_stream() {
+        use crate::proxy::providers::transform_kiro;
+        let mgr = KiroAuthManager::new(Some("http://127.0.0.1:7897".to_string()));
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}]
+        });
+        let cw_body = transform_kiro::anthropic_to_cw_request(&body);
+        let resp = mgr
+            .send_generate_assistant_response(cw_body)
+            .await
+            .expect("send failed");
+        println!("[live] status = {}", resp.status());
+        let bytes = resp.bytes().await.expect("read bytes failed");
+        let mut decoder = transform_kiro::EventStreamDecoder::new();
+        let events = decoder.push(&bytes);
+        let usage = transform_kiro::extract_kiro_usage(&events);
+        for (i, ev) in events.iter().enumerate() {
+            println!(
+                "[live] #{i} event_type={} payload={}",
+                ev.event_type,
+                String::from_utf8_lossy(&ev.payload)
+            );
+        }
+        println!(
+            "[live] extracted: credits={} output_tokens={} context%={:?}",
+            usage.credits, usage.output_tokens, usage.context_usage_pct
+        );
+        // 实测响应一定含 meteringEvent → credits > 0
+        assert!(usage.credits > 0.0, "expected meteringEvent credits > 0");
+    }
+
+    /// 实测 GetUsageLimits（套餐额度）。
+    /// 运行：`cargo test --lib proxy::providers::kiro_auth::tests::live_get_usage_limits -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_get_usage_limits() {
+        let mgr = KiroAuthManager::new(Some("http://127.0.0.1:7897".to_string()));
+        let limits = mgr
+            .get_usage_limits()
+            .await
+            .expect("get_usage_limits failed");
+        println!(
+            "[live] plan={:?} used={} limit={} unit={:?} reset={:?}",
+            limits.plan_title,
+            limits.current_usage,
+            limits.usage_limit,
+            limits.display_name_plural,
+            limits.next_date_reset
+        );
+        assert!(limits.usage_limit > 0.0, "expected positive usage_limit");
     }
 }

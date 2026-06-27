@@ -7,6 +7,7 @@
 //! - 各 handler 只保留独特的业务逻辑
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
+use super::kiro_handler;
 use super::{
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
@@ -23,7 +24,7 @@ use super::{
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
-        transform_codex_chat, transform_gemini, transform_kiro, transform_responses,
+        transform_codex_chat, transform_gemini, transform_responses,
     },
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
@@ -186,8 +187,12 @@ async fn handle_messages_for_app(
 
     // Kiro (Amazon Q / CodeWhisperer) 供应商：不走通用透传转发，使用专用
     // CodeWhisperer 协议转换 handler（请求 Anthropic→CW，响应 event-stream→SSE）。
-    if let Some(provider) = ctx.get_providers().into_iter().find(provider_is_kiro) {
-        return handle_kiro_messages(&state, &body, provider, is_stream).await;
+    if let Some(provider) = ctx
+        .get_providers()
+        .into_iter()
+        .find(kiro_handler::provider_is_kiro)
+    {
+        return kiro_handler::handle_kiro_messages(&state, &body, provider, is_stream).await;
     }
 
     // 转发请求
@@ -251,197 +256,6 @@ async fn handle_messages_for_app(
         connection_guard,
     )
     .await
-}
-
-// ============================================================================
-// Kiro (Amazon Q / CodeWhisperer) 专用 handler
-// ============================================================================
-
-/// 判断 provider 是否为 Kiro 类型（meta.provider_type == "kiro"）
-fn provider_is_kiro(provider: &crate::provider::Provider) -> bool {
-    provider
-        .meta
-        .as_ref()
-        .and_then(|m| m.provider_type.as_deref())
-        == Some("kiro")
-}
-
-/// 从 Kiro provider 配置解析上游代理地址（如 clash `http://127.0.0.1:7897`）。
-fn kiro_upstream_proxy(provider: &crate::provider::Provider) -> Option<String> {
-    for key in ["upstreamProxy", "proxyUrl", "upstream_proxy", "proxy_url"] {
-        if let Some(v) = provider
-            .settings_config
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
-/// Kiro 供应商请求处理：Anthropic `/v1/messages` → CodeWhisperer，
-/// 响应 event-stream → Anthropic SSE（或非流式聚合为 Anthropic JSON）。
-async fn handle_kiro_messages(
-    state: &ProxyState,
-    body: &Value,
-    provider: crate::provider::Provider,
-    is_stream: bool,
-) -> Result<axum::response::Response, ProxyError> {
-    let manager = kiro_manager(state, &provider)?;
-
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string());
-    let cw_body = transform_kiro::anthropic_to_cw_request(body);
-
-    let resp = manager
-        .send_generate_assistant_response(cw_body)
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(kiro_upstream_error(resp).await);
-    }
-
-    if is_stream {
-        let upstream = resp.bytes_stream();
-        let sse_stream =
-            transform_kiro::create_anthropic_sse_stream_from_kiro(upstream, model);
-        let resp_body = axum::body::Body::from_stream(sse_stream);
-        return Ok((sse_response_headers(), resp_body).into_response());
-    }
-
-    // 非流式：缓冲全部字节，解码后聚合为单个 Anthropic JSON。
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("读取 Kiro 响应失败: {e}")))?;
-    let mut decoder = transform_kiro::EventStreamDecoder::new();
-    let events = decoder.push(&bytes);
-    let message = transform_kiro::cw_events_to_anthropic_message(&events, model.as_deref());
-    Ok((StatusCode::OK, Json(message)).into_response())
-}
-
-/// 获取 Kiro 认证管理器并按 provider 配置设置上游代理。
-/// 优先用 provider 配置中的代理；缺省时回退到 cc-switch 全局出站代理。
-fn kiro_manager(
-    state: &ProxyState,
-    provider: &crate::provider::Provider,
-) -> Result<std::sync::Arc<crate::proxy::providers::kiro_auth::KiroAuthManager>, ProxyError> {
-    use tauri::Manager;
-    let app_handle = state
-        .app_handle
-        .as_ref()
-        .ok_or_else(|| ProxyError::Internal("Kiro 认证不可用（无 AppHandle）".to_string()))?;
-    let kiro_state = app_handle.state::<crate::commands::kiro::KiroAuthState>();
-    let manager = kiro_state.0.clone();
-    let proxy = kiro_upstream_proxy(provider)
-        .or_else(|| state.db.get_global_proxy_url().ok().flatten());
-    manager.set_proxy(proxy);
-    Ok(manager)
-}
-
-/// 构造 text/event-stream 响应头
-fn sse_response_headers() -> axum::http::HeaderMap {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        "Content-Type",
-        axum::http::HeaderValue::from_static("text/event-stream"),
-    );
-    headers.insert(
-        "Cache-Control",
-        axum::http::HeaderValue::from_static("no-cache"),
-    );
-    headers
-}
-
-/// 将 Kiro 失败响应转为 ProxyError
-async fn kiro_upstream_error(resp: reqwest::Response) -> ProxyError {
-    let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
-    ProxyError::UpstreamError {
-        status,
-        body: Some(text.chars().take(2000).collect()),
-    }
-}
-
-/// Kiro 供应商：OpenAI Chat Completions (`/v1/chat/completions`) → CodeWhisperer
-async fn handle_kiro_openai_chat(
-    state: &ProxyState,
-    body: &Value,
-    provider: crate::provider::Provider,
-    is_stream: bool,
-) -> Result<axum::response::Response, ProxyError> {
-    let manager = kiro_manager(state, &provider)?;
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string());
-    let cw_body = transform_kiro::openai_chat_to_cw_request(body);
-    let resp = manager
-        .send_generate_assistant_response(cw_body)
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(kiro_upstream_error(resp).await);
-    }
-
-    if is_stream {
-        let upstream = resp.bytes_stream();
-        let sse = transform_kiro::create_openai_sse_stream_from_kiro(upstream, model);
-        let resp_body = axum::body::Body::from_stream(sse);
-        return Ok((sse_response_headers(), resp_body).into_response());
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("读取 Kiro 响应失败: {e}")))?;
-    let mut decoder = transform_kiro::EventStreamDecoder::new();
-    let events = decoder.push(&bytes);
-    let message = transform_kiro::cw_events_to_openai_message(&events, model.as_deref());
-    Ok((StatusCode::OK, Json(message)).into_response())
-}
-
-/// Kiro 供应商：OpenAI Responses API (`/v1/responses`, Codex CLI) → CodeWhisperer
-///
-/// 复用既有 Responses↔Chat 转换：Responses 请求→Chat 请求→CW；
-/// CW 响应→Chat SSE→Responses SSE。Codex CLI 始终流式。
-async fn handle_kiro_responses(
-    state: &ProxyState,
-    body: &Value,
-    provider: crate::provider::Provider,
-    codex_tool_context: super::providers::transform_codex_chat::CodexToolContext,
-) -> Result<axum::response::Response, ProxyError> {
-    let manager = kiro_manager(state, &provider)?;
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string());
-
-    // Responses 请求 → Chat Completions 请求 → CW 请求
-    let chat_body = transform_codex_chat::responses_to_chat_completions(body.clone())?;
-    let cw_body = transform_kiro::openai_chat_to_cw_request(&chat_body);
-
-    let resp = manager
-        .send_generate_assistant_response(cw_body)
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(kiro_upstream_error(resp).await);
-    }
-
-    // CW 字节流 → Chat SSE → Responses SSE
-    let upstream = resp.bytes_stream();
-    let chat_sse = transform_kiro::create_openai_sse_stream_from_kiro(upstream, model);
-    let responses_sse =
-        create_responses_sse_stream_from_chat_with_context(chat_sse, codex_tool_context);
-    let resp_body = axum::body::Body::from_stream(responses_sse);
-    Ok((sse_response_headers(), resp_body).into_response())
 }
 
 fn validate_claude_desktop_gateway_auth(
@@ -841,8 +655,12 @@ pub async fn handle_chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if let Some(provider) = ctx.get_providers().into_iter().find(provider_is_kiro) {
-        return handle_kiro_openai_chat(&state, &body, provider, is_stream).await;
+    if let Some(provider) = ctx
+        .get_providers()
+        .into_iter()
+        .find(kiro_handler::provider_is_kiro)
+    {
+        return kiro_handler::handle_kiro_openai_chat(&state, &body, provider, is_stream).await;
     }
 
     let forwarder = ctx.create_forwarder(&state);
@@ -912,8 +730,13 @@ pub async fn handle_responses(
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
 
-    if let Some(provider) = ctx.get_providers().into_iter().find(provider_is_kiro) {
-        return handle_kiro_responses(&state, &body, provider, codex_tool_context).await;
+    if let Some(provider) = ctx
+        .get_providers()
+        .into_iter()
+        .find(kiro_handler::provider_is_kiro)
+    {
+        return kiro_handler::handle_kiro_responses(&state, &body, provider, codex_tool_context)
+            .await;
     }
 
     let forwarder = ctx.create_forwarder(&state);

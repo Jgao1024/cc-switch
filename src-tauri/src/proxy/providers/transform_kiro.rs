@@ -87,8 +87,8 @@ impl EventStreamDecoder {
             if self.buf.len() < 12 {
                 break;
             }
-            let total = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
-                as usize;
+            let total =
+                u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
             if total < 16 || total > 64 * 1024 * 1024 {
                 // 异常长度，丢弃缓冲避免死循环
                 self.buf.clear();
@@ -137,11 +137,11 @@ fn decode_frame(frame: &[u8], headers_len: usize) -> Option<DecodedEvent> {
         // 按类型推进，并在 string 类型时取值
         let mut str_val: Option<String> = None;
         match vtype {
-            0 | 1 => {}        // bool true/false: 0 字节
-            2 => o += 1,        // byte
-            3 => o += 2,        // short
-            4 => o += 4,        // int
-            5 => o += 8,        // long
+            0 | 1 => {}  // bool true/false: 0 字节
+            2 => o += 1, // byte
+            3 => o += 2, // short
+            4 => o += 4, // int
+            5 => o += 8, // long
             6 | 7 => {
                 // bytes / string: [u16 len][data]
                 if o + 2 > headers.len() {
@@ -157,8 +157,8 @@ fn decode_frame(frame: &[u8], headers_len: usize) -> Option<DecodedEvent> {
                 }
                 o += len;
             }
-            8 => o += 8,        // timestamp
-            9 => o += 16,       // uuid
+            8 => o += 8,  // timestamp
+            9 => o += 16, // uuid
             _ => break,
         }
         match name.as_str() {
@@ -213,7 +213,11 @@ pub fn anthropic_to_cw_request(body: &Value) -> Value {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         // 仅在第一条 user 消息前注入 system 文本
         let inject_system = i == 0 && role == "user";
-        let sys = if inject_system { system_text.as_deref() } else { None };
+        let sys = if inject_system {
+            system_text.as_deref()
+        } else {
+            None
+        };
         match role {
             "assistant" => cw_msgs.push(json!({
                 "assistantResponseMessage": anthropic_assistant_to_cw(msg)
@@ -589,7 +593,11 @@ impl KiroToAnthropic {
         let mut out = String::new();
         self.ensure_started(&mut out);
         self.close_open_block(&mut out);
-        let stop_reason = if self.used_tool { "tool_use" } else { "end_turn" };
+        let stop_reason = if self.used_tool {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
         out.push_str(&Self::sse(
             "message_delta",
             &json!({
@@ -603,7 +611,6 @@ impl KiroToAnthropic {
     }
 }
 
-
 /// 将一组 CW 事件聚合为单个 Anthropic Messages 响应 JSON（用于非流式客户端）。
 pub fn cw_events_to_anthropic_message(events: &[DecodedEvent], model: Option<&str>) -> Value {
     let mut text = String::new();
@@ -611,7 +618,8 @@ pub fn cw_events_to_anthropic_message(events: &[DecodedEvent], model: Option<&st
     // 按出现顺序累积工具调用
     let mut tool_order: Vec<String> = Vec::new();
     let mut tool_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut tool_input: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_input: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut used_tool = false;
 
     for ev in events {
@@ -767,18 +775,17 @@ pub fn openai_chat_to_cw_request(body: &Value) -> Value {
     let mut pending_tool_results: Vec<Value> = Vec::new();
     let mut system_injected = false;
 
-    let flush_pending =
-        |cw_msgs: &mut Vec<Value>, pending: &mut Vec<Value>| {
-            if !pending.is_empty() {
-                cw_msgs.push(json!({
-                    "userInputMessage": {
-                        "content": "",
-                        "origin": ORIGIN,
-                        "userInputMessageContext": { "toolResults": std::mem::take(pending) }
-                    }
-                }));
-            }
-        };
+    let flush_pending = |cw_msgs: &mut Vec<Value>, pending: &mut Vec<Value>| {
+        if !pending.is_empty() {
+            cw_msgs.push(json!({
+                "userInputMessage": {
+                    "content": "",
+                    "origin": ORIGIN,
+                    "userInputMessageContext": { "toolResults": std::mem::take(pending) }
+                }
+            }));
+        }
+    };
 
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -1108,7 +1115,8 @@ pub fn cw_events_to_openai_message(events: &[DecodedEvent], model: Option<&str>)
     let mut resolved_model = model.unwrap_or(protocol::DEFAULT_MODEL_ID).to_string();
     let mut tool_order: Vec<String> = Vec::new();
     let mut tool_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut tool_input: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_input: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut used_tool = false;
 
     for ev in events {
@@ -1124,7 +1132,11 @@ pub fn cw_events_to_openai_message(events: &[DecodedEvent], model: Option<&str>)
             }
             "toolUseEvent" => {
                 used_tool = true;
-                let id = j.get("toolUseId").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                let id = j
+                    .get("toolUseId")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if id.is_empty() {
                     continue;
                 }
@@ -1250,7 +1262,10 @@ mod tests {
         // 模型映射：sonnet → claude-sonnet-4.6
         assert_eq!(cur["modelId"], "claude-sonnet-4.6");
         // system 注入到首条 user 文本
-        assert!(cur["content"].as_str().unwrap().contains("You are helpful."));
+        assert!(cur["content"]
+            .as_str()
+            .unwrap()
+            .contains("You are helpful."));
         assert!(cur["content"].as_str().unwrap().contains("Hello"));
         assert_eq!(cw["conversationState"]["chatTriggerType"], "MANUAL");
         assert!(cw["conversationState"].get("history").is_none());
@@ -1258,11 +1273,23 @@ mod tests {
 
     #[test]
     fn test_model_mapping() {
-        assert_eq!(map_model_to_cw(Some("claude-opus-4-1-20250101")), "claude-opus-4.8");
-        assert_eq!(map_model_to_cw(Some("claude-3-5-sonnet")), "claude-sonnet-4.6");
-        assert_eq!(map_model_to_cw(Some("claude-3-5-haiku")), "claude-sonnet-4.6");
+        assert_eq!(
+            map_model_to_cw(Some("claude-opus-4-1-20250101")),
+            "claude-opus-4.8"
+        );
+        assert_eq!(
+            map_model_to_cw(Some("claude-3-5-sonnet")),
+            "claude-sonnet-4.6"
+        );
+        assert_eq!(
+            map_model_to_cw(Some("claude-3-5-haiku")),
+            "claude-sonnet-4.6"
+        );
         assert_eq!(map_model_to_cw(Some("claude-opus-4.8")), "claude-opus-4.8");
-        assert_eq!(map_model_to_cw(Some("claude-sonnet-4.6")), "claude-sonnet-4.6");
+        assert_eq!(
+            map_model_to_cw(Some("claude-sonnet-4.6")),
+            "claude-sonnet-4.6"
+        );
         assert_eq!(map_model_to_cw(None), "claude-sonnet-4.6");
     }
 
@@ -1309,8 +1336,8 @@ mod tests {
         assert_eq!(tu["name"], "get_weather");
         assert_eq!(tu["input"]["city"], "Tokyo");
         // currentMessage 带 toolResults
-        let cur_ctx =
-            &cw["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"];
+        let cur_ctx = &cw["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"];
         assert_eq!(cur_ctx["toolResults"][0]["toolUseId"], "t1");
         assert_eq!(cur_ctx["toolResults"][0]["status"], "success");
         assert_eq!(cur_ctx["toolResults"][0]["content"][0]["text"], "sunny 22C");
@@ -1397,11 +1424,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("be brief"));
-        assert_eq!(hist[1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"], "call_1");
-        assert_eq!(hist[1]["assistantResponseMessage"]["toolUses"][0]["input"]["city"], "Tokyo");
+        assert_eq!(
+            hist[1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"],
+            "call_1"
+        );
+        assert_eq!(
+            hist[1]["assistantResponseMessage"]["toolUses"][0]["input"]["city"],
+            "Tokyo"
+        );
         // 末尾 tool 结果 → currentMessage.toolResults
-        let cur_ctx =
-            &cw["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"];
+        let cur_ctx = &cw["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"];
         assert_eq!(cur_ctx["toolResults"][0]["toolUseId"], "call_1");
         assert_eq!(cur_ctx["toolResults"][0]["content"][0]["text"], "sunny 22C");
         assert!(cur_ctx.get("tools").is_some());
@@ -1446,13 +1479,11 @@ mod tests {
 
     #[test]
     fn test_cw_events_to_openai_message_aggregation() {
-        let events = vec![
-            DecodedEvent {
-                event_type: "assistantResponseEvent".into(),
-                message_type: None,
-                payload: br#"{"content":"hello","modelId":"claude-sonnet-4.5"}"#.to_vec(),
-            },
-        ];
+        let events = vec![DecodedEvent {
+            event_type: "assistantResponseEvent".into(),
+            message_type: None,
+            payload: br#"{"content":"hello","modelId":"claude-sonnet-4.5"}"#.to_vec(),
+        }];
         let msg = cw_events_to_openai_message(&events, None);
         assert_eq!(msg["object"], "chat.completion");
         assert_eq!(msg["choices"][0]["message"]["content"], "hello");

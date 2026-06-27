@@ -22,8 +22,7 @@ pub mod protocol {
     pub const CW_ENDPOINT: &str = "https://codewhisperer.us-east-1.amazonaws.com/";
 
     /// 非流式服务前缀（ListAvailableProfiles / GetUsageLimits 等）
-    pub const TARGET_LIST_PROFILES: &str =
-        "AmazonCodeWhispererService.ListAvailableProfiles";
+    pub const TARGET_LIST_PROFILES: &str = "AmazonCodeWhispererService.ListAvailableProfiles";
     /// 列出可用模型
     pub const TARGET_LIST_MODELS: &str = "AmazonCodeWhispererService.ListAvailableModels";
     /// 流式聊天操作
@@ -124,11 +123,9 @@ fn read_auth_kv(db_path: &PathBuf, key: &str) -> Option<String> {
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    conn.query_row(
-        "SELECT value FROM auth_kv WHERE key = ?1",
-        [key],
-        |row| row.get::<_, String>(0),
-    )
+    conn.query_row("SELECT value FROM auth_kv WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
     .ok()
 }
 
@@ -203,8 +200,7 @@ impl KiroAuthManager {
         let proxy = self.proxy_url.read().ok().and_then(|p| p.clone());
         if let Some(proxy) = proxy {
             builder = builder.proxy(
-                reqwest::Proxy::all(&proxy)
-                    .map_err(|e| KiroAuthError::Network(e.to_string()))?,
+                reqwest::Proxy::all(&proxy).map_err(|e| KiroAuthError::Network(e.to_string()))?,
             );
         }
         builder
@@ -273,8 +269,8 @@ impl KiroAuthManager {
                 c.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
             )
         };
-        let refresh_token = refresh_token
-            .ok_or_else(|| KiroAuthError::RefreshFailed("no refresh_token".into()))?;
+        let refresh_token =
+            refresh_token.ok_or_else(|| KiroAuthError::RefreshFailed("no refresh_token".into()))?;
         let reg = read_kirocli_registration().ok_or_else(|| {
             KiroAuthError::RefreshFailed("no device-registration for refresh".into())
         })?;
@@ -309,8 +305,8 @@ impl KiroAuthManager {
         }
 
         // OIDC CreateToken 返回 {accessToken, refreshToken?, expiresIn, ...}
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| KiroAuthError::RefreshFailed(e.to_string()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| KiroAuthError::RefreshFailed(e.to_string()))?;
         let new_access = v
             .get("accessToken")
             .and_then(|x| x.as_str())
@@ -329,8 +325,7 @@ impl KiroAuthManager {
                 c.refresh_token = Some(r);
             }
             if let Some(secs) = expires_in {
-                c.expires_at =
-                    Some((Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339());
+                c.expires_at = Some((Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339());
             }
         }
         Ok(())
@@ -370,8 +365,8 @@ impl KiroAuthManager {
                 text.chars().take(300).collect::<String>()
             )));
         }
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| KiroAuthError::ProfileFetch(e.to_string()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| KiroAuthError::ProfileFetch(e.to_string()))?;
         let arn = v
             .get("profiles")
             .and_then(|p| p.as_array())
@@ -390,9 +385,7 @@ impl KiroAuthManager {
 
     /// 列出 CodeWhisperer 可用模型（origin=AI_EDITOR，含 sonnet-4.6 / opus-4.8 等）。
     /// 返回 (modelId, description)。
-    pub async fn list_models(
-        &self,
-    ) -> Result<Vec<(String, Option<String>)>, KiroAuthError> {
+    pub async fn list_models(&self) -> Result<Vec<(String, Option<String>)>, KiroAuthError> {
         let token = self.get_valid_token().await?;
         let arn = self.get_profile_arn().await?;
         let client = self.http_client()?;
@@ -461,7 +454,6 @@ impl KiroAuthManager {
         Ok(resp)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

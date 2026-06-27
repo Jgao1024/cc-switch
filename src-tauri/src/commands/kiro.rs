@@ -13,10 +13,7 @@ use crate::store::AppState;
 pub struct KiroAuthState(pub Arc<KiroAuthManager>);
 
 /// 解析上游代理：优先显式入参，其次 cc-switch 全局出站代理。
-fn resolve_kiro_proxy(
-    explicit: Option<String>,
-    app_state: &State<'_, AppState>,
-) -> Option<String> {
+fn resolve_kiro_proxy(explicit: Option<String>, app_state: &State<'_, AppState>) -> Option<String> {
     explicit
         .filter(|s| !s.trim().is_empty())
         .or_else(|| app_state.db.get_global_proxy_url().ok().flatten())
@@ -43,11 +40,7 @@ pub async fn kiro_prefetch_profile(
     app_state: State<'_, AppState>,
 ) -> Result<String, String> {
     state.0.set_proxy(resolve_kiro_proxy(proxy_url, &app_state));
-    state
-        .0
-        .get_profile_arn()
-        .await
-        .map_err(|e| e.to_string())
+    state.0.get_profile_arn().await.map_err(|e| e.to_string())
 }
 
 /// 列出 CodeWhisperer 可用模型（用于「获取模型列表」按钮）。
@@ -62,9 +55,6 @@ pub async fn kiro_list_models(
     let models = state.0.list_models().await.map_err(|e| e.to_string())?;
     Ok(models
         .into_iter()
-        .map(|(id, desc)| crate::services::model_fetch::FetchedModel {
-            id,
-            owned_by: desc,
-        })
+        .map(|(id, desc)| crate::services::model_fetch::FetchedModel { id, owned_by: desc })
         .collect())
 }

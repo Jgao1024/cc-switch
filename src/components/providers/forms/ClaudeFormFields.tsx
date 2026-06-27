@@ -36,6 +36,7 @@ import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelInputWithFetch } from "./shared";
 import { CopilotAuthSection } from "./CopilotAuthSection";
 import { CodexOAuthSection } from "./CodexOAuthSection";
+import { KiroAuthSection } from "./KiroAuthSection";
 import {
   copilotGetModels,
   copilotGetModelsForAccount,
@@ -97,6 +98,9 @@ interface ClaudeFormFieldsProps {
   onCodexAccountSelect?: (accountId: string | null) => void;
   codexFastMode?: boolean;
   onCodexFastModeChange?: (enabled: boolean) => void;
+
+  // Kiro (Amazon Q / CodeWhisperer)
+  isKiroPreset?: boolean;
 
   // Template Values
   templateValueEntries: Array<[string, TemplateValueConfig]>;
@@ -173,6 +177,7 @@ export function ClaudeFormFields({
   onCodexAccountSelect,
   codexFastMode,
   onCodexFastModeChange,
+  isKiroPreset,
   templateValueEntries,
   templateValues,
   templatePresetName,
@@ -604,6 +609,9 @@ export function ClaudeFormFields({
           onFastModeChange={onCodexFastModeChange}
         />
       )}
+
+      {/* Kiro (Amazon Q / CodeWhisperer) 凭证继承 */}
+      {isKiroPreset && <KiroAuthSection />}
 
       {/* API Key 输入框（非 OAuth 预设时显示） */}
       {shouldShowApiKey && !usesOAuth && (

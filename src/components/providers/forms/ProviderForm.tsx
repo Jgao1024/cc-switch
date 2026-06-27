@@ -1135,6 +1135,9 @@ function ProviderFormFull({
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
+    const isKiroProvider =
+      templatePreset?.providerType === "kiro" ||
+      initialData?.meta?.providerType === "kiro";
     if (isCopilotProvider && !isCopilotAuthenticated) {
       toast.error(
         t("copilot.loginRequired", {
@@ -1194,7 +1197,12 @@ function ProviderFormFull({
             }),
           );
         }
-        if (!isCopilotProvider && !isCodexOauthProvider && !apiKey.trim()) {
+        if (
+          !isCopilotProvider &&
+          !isCodexOauthProvider &&
+          !isKiroProvider &&
+          !apiKey.trim()
+        ) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
@@ -2064,6 +2072,10 @@ function ProviderFormFull({
               isCodexOauthPreset={
                 templatePreset?.providerType === "codex_oauth" ||
                 initialData?.meta?.providerType === "codex_oauth"
+              }
+              isKiroPreset={
+                templatePreset?.providerType === "kiro" ||
+                initialData?.meta?.providerType === "kiro"
               }
               usesOAuth={
                 templatePreset?.requiresOAuth === true ||

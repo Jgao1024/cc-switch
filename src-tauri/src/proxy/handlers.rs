@@ -290,15 +290,7 @@ async fn handle_kiro_messages(
     provider: crate::provider::Provider,
     is_stream: bool,
 ) -> Result<axum::response::Response, ProxyError> {
-    use tauri::Manager;
-
-    let app_handle = state
-        .app_handle
-        .as_ref()
-        .ok_or_else(|| ProxyError::Internal("Kiro 认证不可用（无 AppHandle）".to_string()))?;
-    let kiro_state = app_handle.state::<crate::commands::kiro::KiroAuthState>();
-    let manager = kiro_state.0.clone();
-    manager.set_proxy(kiro_upstream_proxy(&provider));
+    let manager = kiro_manager(state, &provider)?;
 
     let model = body
         .get("model")
@@ -311,30 +303,16 @@ async fn handle_kiro_messages(
         .await
         .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ProxyError::UpstreamError {
-            status: status.as_u16(),
-            body: Some(text.chars().take(2000).collect()),
-        });
+    if !resp.status().is_success() {
+        return Err(kiro_upstream_error(resp).await);
     }
 
     if is_stream {
         let upstream = resp.bytes_stream();
         let sse_stream =
             transform_kiro::create_anthropic_sse_stream_from_kiro(upstream, model);
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "Content-Type",
-            axum::http::HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            "Cache-Control",
-            axum::http::HeaderValue::from_static("no-cache"),
-        );
         let resp_body = axum::body::Body::from_stream(sse_stream);
-        return Ok((headers, resp_body).into_response());
+        return Ok((sse_response_headers(), resp_body).into_response());
     }
 
     // 非流式：缓冲全部字节，解码后聚合为单个 Anthropic JSON。
@@ -349,6 +327,7 @@ async fn handle_kiro_messages(
 }
 
 /// 获取 Kiro 认证管理器并按 provider 配置设置上游代理。
+/// 优先用 provider 配置中的代理；缺省时回退到 cc-switch 全局出站代理。
 fn kiro_manager(
     state: &ProxyState,
     provider: &crate::provider::Provider,
@@ -360,7 +339,9 @@ fn kiro_manager(
         .ok_or_else(|| ProxyError::Internal("Kiro 认证不可用（无 AppHandle）".to_string()))?;
     let kiro_state = app_handle.state::<crate::commands::kiro::KiroAuthState>();
     let manager = kiro_state.0.clone();
-    manager.set_proxy(kiro_upstream_proxy(provider));
+    let proxy = kiro_upstream_proxy(provider)
+        .or_else(|| state.db.get_global_proxy_url().ok().flatten());
+    manager.set_proxy(proxy);
     Ok(manager)
 }
 

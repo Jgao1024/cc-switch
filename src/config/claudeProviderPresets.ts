@@ -1134,6 +1134,30 @@ export const providerPresets: ProviderPreset[] = [
     iconColor: "#000000",
   },
   {
+    name: "Kiro (Amazon Q)",
+    websiteUrl: "https://kiro.dev",
+    settingsConfig: {
+      env: {
+        // base_url 仅作占位；Kiro 请求由本地代理拦截并改走 CodeWhisperer。
+        ANTHROPIC_BASE_URL: "https://codewhisperer.us-east-1.amazonaws.com",
+        ANTHROPIC_MODEL: "claude-sonnet-4.5",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-sonnet-4.5",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4.5",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-sonnet-4.5",
+        ANTHROPIC_AUTH_TOKEN: "kiro",
+      },
+      // 上游代理（CodeWhisperer 在海外，按需经代理转发）。
+      // 留空则回退到 cc-switch 全局出站代理。
+      upstreamProxy: "http://127.0.0.1:7897",
+    },
+    category: "third_party",
+    apiFormat: "anthropic",
+    providerType: "kiro",
+    requiresOAuth: true,
+    icon: "generic",
+    iconColor: "#7C3AED",
+  },
+  {
     name: "Nvidia",
     websiteUrl: "https://build.nvidia.com",
     apiKeyUrl: "https://build.nvidia.com/settings/api-keys",

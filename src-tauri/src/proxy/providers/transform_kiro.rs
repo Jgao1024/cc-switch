@@ -695,6 +695,434 @@ pub fn create_anthropic_sse_stream_from_kiro(
     }
 }
 
+// ===================================================================
+// Part E: OpenAI Chat Completions ↔ CodeWhisperer
+// ===================================================================
+
+/// OpenAI Chat Completions 请求体 → CodeWhisperer 请求体（不含 profileArn）。
+pub fn openai_chat_to_cw_request(body: &Value) -> Value {
+    let tools = body.get("tools").and_then(|t| t.as_array());
+    let cw_tools = tools.map(|arr| {
+        arr.iter()
+            .filter_map(openai_tool_to_cw)
+            .collect::<Vec<Value>>()
+    });
+
+    let empty = vec![];
+    let messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+
+    // 先提取 system 文本
+    let system_text: Option<String> = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .and_then(|m| openai_content_to_text(m.get("content")))
+        .filter(|s| !s.is_empty());
+
+    let mut cw_msgs: Vec<Value> = Vec::new();
+    // 待并入下一条 userInputMessage 的 toolResults（来自 role:tool 消息）
+    let mut pending_tool_results: Vec<Value> = Vec::new();
+    let mut system_injected = false;
+
+    let flush_pending =
+        |cw_msgs: &mut Vec<Value>, pending: &mut Vec<Value>| {
+            if !pending.is_empty() {
+                cw_msgs.push(json!({
+                    "userInputMessage": {
+                        "content": "",
+                        "origin": "CLI",
+                        "userInputMessageContext": { "toolResults": std::mem::take(pending) }
+                    }
+                }));
+            }
+        };
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        match role {
+            "system" => { /* 已并入首条 user */ }
+            "tool" => {
+                pending_tool_results.push(openai_tool_message_to_cw(msg));
+            }
+            "assistant" => {
+                flush_pending(&mut cw_msgs, &mut pending_tool_results);
+                cw_msgs.push(json!({
+                    "assistantResponseMessage": openai_assistant_to_cw(msg)
+                }));
+            }
+            _ => {
+                // user
+                flush_pending(&mut cw_msgs, &mut pending_tool_results);
+                let mut text = openai_content_to_text(msg.get("content")).unwrap_or_default();
+                if !system_injected {
+                    if let Some(sys) = system_text.as_deref() {
+                        text = if text.is_empty() {
+                            sys.to_string()
+                        } else {
+                            format!("{sys}\n{text}")
+                        };
+                    }
+                    system_injected = true;
+                }
+                cw_msgs.push(json!({
+                    "userInputMessage": { "content": text, "origin": "CLI" }
+                }));
+            }
+        }
+    }
+    // 末尾剩余 tool 结果 → 独立 user 消息
+    flush_pending(&mut cw_msgs, &mut pending_tool_results);
+
+    // currentMessage 取末尾 user 消息（不是 user 则补空）
+    let mut current = if cw_msgs
+        .last()
+        .and_then(|m| m.get("userInputMessage"))
+        .is_some()
+    {
+        cw_msgs.pop().unwrap()
+    } else {
+        json!({ "userInputMessage": { "content": "", "origin": "CLI" } })
+    };
+
+    // 工具定义挂到 currentMessage 上
+    if let Some(t) = cw_tools.as_ref() {
+        if !t.is_empty() {
+            let uim = current
+                .get_mut("userInputMessage")
+                .and_then(|v| v.as_object_mut())
+                .unwrap();
+            let ctx = uim
+                .entry("userInputMessageContext")
+                .or_insert_with(|| json!({}));
+            ctx["tools"] = json!(t);
+        }
+    }
+
+    let mut conversation_state = json!({
+        "chatTriggerType": "MANUAL",
+        "currentMessage": current,
+    });
+    if !cw_msgs.is_empty() {
+        conversation_state["history"] = json!(cw_msgs);
+    }
+    json!({ "conversationState": conversation_state })
+}
+
+/// OpenAI content（字符串或数组）→ 纯文本
+fn openai_content_to_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(arr)) => {
+            let joined = arr
+                .iter()
+                .filter_map(|b| {
+                    // {type:"text", text:".."} 或 {type:"input_text", text:".."}
+                    b.get("text").and_then(|t| t.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            Some(joined)
+        }
+        _ => None,
+    }
+}
+
+/// OpenAI tool 定义 → CW Tool
+fn openai_tool_to_cw(tool: &Value) -> Option<Value> {
+    let func = tool.get("function").unwrap_or(tool);
+    let name = func.get("name").and_then(|n| n.as_str())?;
+    let schema = func
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "object"}));
+    let mut spec = json!({ "name": name, "inputSchema": { "json": schema } });
+    if let Some(d) = func.get("description").and_then(|d| d.as_str()) {
+        spec["description"] = json!(d);
+    }
+    Some(json!({ "toolSpecification": spec }))
+}
+
+/// OpenAI assistant 消息 → CW assistantResponseMessage
+fn openai_assistant_to_cw(msg: &Value) -> Value {
+    let content = openai_content_to_text(msg.get("content")).unwrap_or_default();
+    let mut out = json!({ "content": content });
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+        let tool_uses: Vec<Value> = tool_calls
+            .iter()
+            .filter_map(|tc| {
+                let func = tc.get("function")?;
+                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let args = func
+                    .get("arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}");
+                let input: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+                Some(json!({
+                    "toolUseId": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                    "name": name,
+                    "input": input,
+                }))
+            })
+            .collect();
+        if !tool_uses.is_empty() {
+            out["toolUses"] = json!(tool_uses);
+        }
+    }
+    out
+}
+
+/// OpenAI role:tool 消息 → CW ToolResult
+fn openai_tool_message_to_cw(msg: &Value) -> Value {
+    let tool_use_id = msg
+        .get("tool_call_id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("");
+    let text = openai_content_to_text(msg.get("content")).unwrap_or_default();
+    json!({
+        "toolUseId": tool_use_id,
+        "content": [{ "text": text }],
+        "status": "success",
+    })
+}
+
+/// 有状态转换器：CW 事件 → OpenAI Chat Completions chunk SSE。
+pub struct KiroToOpenAIChat {
+    id: String,
+    model: String,
+    created: i64,
+    role_sent: bool,
+    tool_index: i64,
+    open_tool: bool,
+    used_tool: bool,
+    finished: bool,
+}
+
+impl KiroToOpenAIChat {
+    pub fn new(model: Option<&str>) -> Self {
+        Self {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+            model: model.unwrap_or(protocol::DEFAULT_MODEL_ID).to_string(),
+            created: chrono::Utc::now().timestamp(),
+            role_sent: false,
+            tool_index: -1,
+            open_tool: false,
+            used_tool: false,
+            finished: false,
+        }
+    }
+
+    fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
+        let c = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }]
+        });
+        format!("data: {c}\n\n")
+    }
+
+    pub fn handle(&mut self, ev: &DecodedEvent) -> String {
+        let mut out = String::new();
+        let Some(j) = ev.json() else { return out };
+        match ev.event_type.as_str() {
+            "assistantResponseEvent" => {
+                let content = j.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    return out;
+                }
+                if let Some(m) = j.get("modelId").and_then(|m| m.as_str()) {
+                    self.model = m.to_string();
+                }
+                let delta = if !self.role_sent {
+                    self.role_sent = true;
+                    json!({"role": "assistant", "content": content})
+                } else {
+                    json!({"content": content})
+                };
+                out.push_str(&self.chunk(delta, None));
+            }
+            "toolUseEvent" => {
+                let stop = j.get("stop").and_then(|s| s.as_bool()).unwrap_or(false);
+                let name = j.get("name").and_then(|n| n.as_str());
+                let id = j.get("toolUseId").and_then(|i| i.as_str());
+                if !self.open_tool && name.is_some() && !stop {
+                    self.tool_index += 1;
+                    self.open_tool = true;
+                    self.used_tool = true;
+                    let mut delta = json!({
+                        "tool_calls": [{
+                            "index": self.tool_index,
+                            "id": id.unwrap_or(""),
+                            "type": "function",
+                            "function": {"name": name.unwrap_or(""), "arguments": ""}
+                        }]
+                    });
+                    if !self.role_sent {
+                        self.role_sent = true;
+                        delta["role"] = json!("assistant");
+                    }
+                    out.push_str(&self.chunk(delta, None));
+                }
+                if let Some(input) = j.get("input").and_then(|i| i.as_str()) {
+                    if !input.is_empty() {
+                        out.push_str(&self.chunk(
+                            json!({
+                                "tool_calls": [{
+                                    "index": self.tool_index,
+                                    "function": {"arguments": input}
+                                }]
+                            }),
+                            None,
+                        ));
+                    }
+                }
+                if stop {
+                    self.open_tool = false;
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    pub fn finish(&mut self) -> String {
+        if self.finished {
+            return String::new();
+        }
+        self.finished = true;
+        let mut out = String::new();
+        if !self.role_sent {
+            // 无任何内容时也要给出合法的首块
+            out.push_str(&self.chunk(json!({"role": "assistant", "content": ""}), None));
+            self.role_sent = true;
+        }
+        let reason = if self.used_tool { "tool_calls" } else { "stop" };
+        out.push_str(&self.chunk(json!({}), Some(reason)));
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+}
+
+/// CW 字节流 → OpenAI Chat Completions SSE 字节流。
+pub fn create_openai_sse_stream_from_kiro(
+    upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    model: Option<String>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut decoder = EventStreamDecoder::new();
+        let mut conv = KiroToOpenAIChat::new(model.as_deref());
+        futures::pin_mut!(upstream);
+        use futures::StreamExt;
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(bytes) => {
+                    for ev in decoder.push(&bytes) {
+                        if ev.message_type.as_deref() == Some("exception") {
+                            let msg = ev
+                                .json()
+                                .and_then(|j| j.get("message").and_then(|m| m.as_str()).map(String::from))
+                                .unwrap_or_else(|| ev.event_type.clone());
+                            let err = json!({"error": {"message": msg, "type": "api_error"}});
+                            yield Ok(Bytes::from(format!("data: {err}\n\n")));
+                            return;
+                        }
+                        let sse = conv.handle(&ev);
+                        if !sse.is_empty() {
+                            yield Ok(Bytes::from(sse));
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+                    return;
+                }
+            }
+        }
+        let fin = conv.finish();
+        if !fin.is_empty() {
+            yield Ok(Bytes::from(fin));
+        }
+    }
+}
+
+/// CW 事件聚合为单个 OpenAI Chat Completions 响应 JSON（非流式客户端用）。
+pub fn cw_events_to_openai_message(events: &[DecodedEvent], model: Option<&str>) -> Value {
+    let mut text = String::new();
+    let mut resolved_model = model.unwrap_or(protocol::DEFAULT_MODEL_ID).to_string();
+    let mut tool_order: Vec<String> = Vec::new();
+    let mut tool_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_input: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut used_tool = false;
+
+    for ev in events {
+        let Some(j) = ev.json() else { continue };
+        match ev.event_type.as_str() {
+            "assistantResponseEvent" => {
+                if let Some(c) = j.get("content").and_then(|c| c.as_str()) {
+                    text.push_str(c);
+                }
+                if let Some(m) = j.get("modelId").and_then(|m| m.as_str()) {
+                    resolved_model = m.to_string();
+                }
+            }
+            "toolUseEvent" => {
+                used_tool = true;
+                let id = j.get("toolUseId").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                if !tool_order.contains(&id) {
+                    tool_order.push(id.clone());
+                }
+                if let Some(n) = j.get("name").and_then(|n| n.as_str()) {
+                    tool_name.entry(id.clone()).or_insert_with(|| n.to_string());
+                }
+                if let Some(inp) = j.get("input").and_then(|i| i.as_str()) {
+                    tool_input.entry(id.clone()).or_default().push_str(inp);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut message = json!({ "role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) } });
+    if !tool_order.is_empty() {
+        let tool_calls: Vec<Value> = tool_order
+            .iter()
+            .map(|id| {
+                let args = tool_input.get(id).cloned().unwrap_or_default();
+                let args = if args.trim().is_empty() { "{}".to_string() } else { args };
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": tool_name.get(id).cloned().unwrap_or_default(), "arguments": args}
+                })
+            })
+            .collect();
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": resolved_model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": if used_tool { "tool_calls" } else { "stop" }
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +1314,89 @@ mod tests {
         assert!(fin.contains("\"stop_reason\":\"tool_use\""));
     }
 
+    #[test]
+    fn test_openai_chat_request_with_tools_and_tool_msg() {
+        let body = json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny 22C"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "description": "w", "parameters": {"type": "object"}}}]
+        });
+        let cw = openai_chat_to_cw_request(&body);
+        let hist = cw["conversationState"]["history"].as_array().unwrap();
+        // user(含system前缀) + assistant(toolUses)
+        assert!(hist[0]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("be brief"));
+        assert_eq!(hist[1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"], "call_1");
+        assert_eq!(hist[1]["assistantResponseMessage"]["toolUses"][0]["input"]["city"], "Tokyo");
+        // 末尾 tool 结果 → currentMessage.toolResults
+        let cur_ctx =
+            &cw["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"];
+        assert_eq!(cur_ctx["toolResults"][0]["toolUseId"], "call_1");
+        assert_eq!(cur_ctx["toolResults"][0]["content"][0]["text"], "sunny 22C");
+        assert!(cur_ctx.get("tools").is_some());
+    }
+
+    #[test]
+    fn test_cw_to_openai_chunk_text() {
+        let mut conv = KiroToOpenAIChat::new(Some("claude-sonnet-4.5"));
+        let out = conv.handle(&DecodedEvent {
+            event_type: "assistantResponseEvent".into(),
+            message_type: None,
+            payload: br#"{"content":"Hi"}"#.to_vec(),
+        });
+        assert!(out.contains("chat.completion.chunk"));
+        assert!(out.contains("\"role\":\"assistant\""));
+        assert!(out.contains("\"content\":\"Hi\""));
+        let fin = conv.finish();
+        assert!(fin.contains("\"finish_reason\":\"stop\""));
+        assert!(fin.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_cw_to_openai_chunk_tool() {
+        let mut conv = KiroToOpenAIChat::new(None);
+        let start = conv.handle(&DecodedEvent {
+            event_type: "toolUseEvent".into(),
+            message_type: None,
+            payload: br#"{"name":"get_weather","toolUseId":"call_1"}"#.to_vec(),
+        });
+        assert!(start.contains("\"tool_calls\""));
+        assert!(start.contains("call_1"));
+        assert!(start.contains("get_weather"));
+        let delta = conv.handle(&DecodedEvent {
+            event_type: "toolUseEvent".into(),
+            message_type: None,
+            payload: br#"{"input":"{\"city\":","toolUseId":"call_1"}"#.to_vec(),
+        });
+        assert!(delta.contains("arguments"));
+        let fin = conv.finish();
+        assert!(fin.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn test_cw_events_to_openai_message_aggregation() {
+        let events = vec![
+            DecodedEvent {
+                event_type: "assistantResponseEvent".into(),
+                message_type: None,
+                payload: br#"{"content":"hello","modelId":"claude-sonnet-4.5"}"#.to_vec(),
+            },
+        ];
+        let msg = cw_events_to_openai_message(&events, None);
+        assert_eq!(msg["object"], "chat.completion");
+        assert_eq!(msg["choices"][0]["message"]["content"], "hello");
+        assert_eq!(msg["choices"][0]["finish_reason"], "stop");
+    }
+
     /// 全链路实测：Anthropic 请求 → CW → clash 7897 → 解码 → Anthropic SSE。
     /// 需本地 kiro-cli 登录态 + clash 代理。运行：
     /// `cargo test --lib proxy::providers::transform_kiro -- --ignored --nocapture`
@@ -934,5 +1445,37 @@ mod tests {
             .collect();
         println!("ASSISTANT TEXT: {text:?}");
         assert!(text.contains("PIPELINE_OK"), "unexpected text: {text}");
+    }
+
+    /// 全链路实测：OpenAI Chat 请求 → CW → clash → OpenAI chunk SSE。
+    #[tokio::test]
+    #[ignore]
+    async fn live_openai_chat_pipeline_via_clash() {
+        use super::super::kiro_auth::KiroAuthManager;
+        let mgr = KiroAuthManager::new(Some("http://127.0.0.1:7897".to_string()));
+        let req = json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Reply with exactly: CHAT_OK"}],
+            "stream": true
+        });
+        let cw_body = openai_chat_to_cw_request(&req);
+        let resp = mgr
+            .send_generate_assistant_response(cw_body)
+            .await
+            .expect("send failed");
+        assert_eq!(resp.status().as_u16(), 200);
+        let bytes = resp.bytes().await.expect("read failed");
+        let mut dec = EventStreamDecoder::new();
+        let events = dec.push(&bytes);
+        let mut conv = KiroToOpenAIChat::new(None);
+        let mut sse = String::new();
+        for ev in &events {
+            sse.push_str(&conv.handle(ev));
+        }
+        sse.push_str(&conv.finish());
+        println!("{sse}");
+        assert!(sse.contains("chat.completion.chunk"));
+        assert!(sse.contains("data: [DONE]"));
+        assert!(sse.contains("CHAT_OK"));
     }
 }

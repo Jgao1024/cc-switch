@@ -60,7 +60,8 @@ export interface ProviderPreset {
   // 供应商类型标识（用于特殊供应商检测）
   // - "github_copilot": GitHub Copilot 供应商（需要 OAuth 认证）
   // - "codex_oauth": OpenAI Codex via ChatGPT Plus/Pro 反代（需要 OAuth 认证）
-  providerType?: "github_copilot" | "codex_oauth";
+  // - "kiro": Amazon Q / CodeWhisperer（继承 kiro-cli 登录，经本地代理转发）
+  providerType?: "github_copilot" | "codex_oauth" | "kiro";
 
   // 是否需要 OAuth 认证（而非 API Key）
   requiresOAuth?: boolean;

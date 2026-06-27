@@ -348,6 +348,121 @@ async fn handle_kiro_messages(
     Ok((StatusCode::OK, Json(message)).into_response())
 }
 
+/// 获取 Kiro 认证管理器并按 provider 配置设置上游代理。
+fn kiro_manager(
+    state: &ProxyState,
+    provider: &crate::provider::Provider,
+) -> Result<std::sync::Arc<crate::proxy::providers::kiro_auth::KiroAuthManager>, ProxyError> {
+    use tauri::Manager;
+    let app_handle = state
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| ProxyError::Internal("Kiro 认证不可用（无 AppHandle）".to_string()))?;
+    let kiro_state = app_handle.state::<crate::commands::kiro::KiroAuthState>();
+    let manager = kiro_state.0.clone();
+    manager.set_proxy(kiro_upstream_proxy(provider));
+    Ok(manager)
+}
+
+/// 构造 text/event-stream 响应头
+fn sse_response_headers() -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    headers
+}
+
+/// 将 Kiro 失败响应转为 ProxyError
+async fn kiro_upstream_error(resp: reqwest::Response) -> ProxyError {
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    ProxyError::UpstreamError {
+        status,
+        body: Some(text.chars().take(2000).collect()),
+    }
+}
+
+/// Kiro 供应商：OpenAI Chat Completions (`/v1/chat/completions`) → CodeWhisperer
+async fn handle_kiro_openai_chat(
+    state: &ProxyState,
+    body: &Value,
+    provider: crate::provider::Provider,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let manager = kiro_manager(state, &provider)?;
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let cw_body = transform_kiro::openai_chat_to_cw_request(body);
+    let resp = manager
+        .send_generate_assistant_response(cw_body)
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(kiro_upstream_error(resp).await);
+    }
+
+    if is_stream {
+        let upstream = resp.bytes_stream();
+        let sse = transform_kiro::create_openai_sse_stream_from_kiro(upstream, model);
+        let resp_body = axum::body::Body::from_stream(sse);
+        return Ok((sse_response_headers(), resp_body).into_response());
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ProxyError::Internal(format!("读取 Kiro 响应失败: {e}")))?;
+    let mut decoder = transform_kiro::EventStreamDecoder::new();
+    let events = decoder.push(&bytes);
+    let message = transform_kiro::cw_events_to_openai_message(&events, model.as_deref());
+    Ok((StatusCode::OK, Json(message)).into_response())
+}
+
+/// Kiro 供应商：OpenAI Responses API (`/v1/responses`, Codex CLI) → CodeWhisperer
+///
+/// 复用既有 Responses↔Chat 转换：Responses 请求→Chat 请求→CW；
+/// CW 响应→Chat SSE→Responses SSE。Codex CLI 始终流式。
+async fn handle_kiro_responses(
+    state: &ProxyState,
+    body: &Value,
+    provider: crate::provider::Provider,
+    codex_tool_context: super::providers::transform_codex_chat::CodexToolContext,
+) -> Result<axum::response::Response, ProxyError> {
+    let manager = kiro_manager(state, &provider)?;
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+
+    // Responses 请求 → Chat Completions 请求 → CW 请求
+    let chat_body = transform_codex_chat::responses_to_chat_completions(body.clone())?;
+    let cw_body = transform_kiro::openai_chat_to_cw_request(&chat_body);
+
+    let resp = manager
+        .send_generate_assistant_response(cw_body)
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Kiro 请求失败: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(kiro_upstream_error(resp).await);
+    }
+
+    // CW 字节流 → Chat SSE → Responses SSE
+    let upstream = resp.bytes_stream();
+    let chat_sse = transform_kiro::create_openai_sse_stream_from_kiro(upstream, model);
+    let responses_sse =
+        create_responses_sse_stream_from_chat_with_context(chat_sse, codex_tool_context);
+    let resp_body = axum::body::Body::from_stream(responses_sse);
+    Ok((sse_response_headers(), resp_body).into_response())
+}
+
 fn validate_claude_desktop_gateway_auth(
     state: &ProxyState,
     headers: &axum::http::HeaderMap,
@@ -745,6 +860,10 @@ pub async fn handle_chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    if let Some(provider) = ctx.get_providers().into_iter().find(provider_is_kiro) {
+        return handle_kiro_openai_chat(&state, &body, provider, is_stream).await;
+    }
+
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
@@ -811,6 +930,10 @@ pub async fn handle_responses(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
+
+    if let Some(provider) = ctx.get_providers().into_iter().find(provider_is_kiro) {
+        return handle_kiro_responses(&state, &body, provider, codex_tool_context).await;
+    }
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder

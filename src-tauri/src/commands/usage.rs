@@ -120,6 +120,15 @@ pub fn get_request_detail(
     state.db.get_request_detail(&request_id)
 }
 
+/// 获取单个请求的原始/转接后明细（请求头与体；预留响应）。
+#[tauri::command]
+pub fn get_request_log_details(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<Vec<RequestLogPayload>, AppError> {
+    state.db.get_request_log_details(&request_id)
+}
+
 /// 获取模型定价列表
 #[tauri::command]
 pub fn get_model_pricing(state: State<'_, AppState>) -> Result<Vec<ModelPricingInfo>, AppError> {

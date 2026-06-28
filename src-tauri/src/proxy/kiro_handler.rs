@@ -86,10 +86,58 @@ fn estimate_input_tokens(body: &Value) -> u32 {
     transform_kiro::estimate_tokens_in_value(body).min(u32::MAX as u64) as u32
 }
 
-/// 异步记录一条 kiro 用量 + 请求明细日志（套餐：credits 计量，token 为估算值）。
+/// 是否启用日志记录。
+fn logging_enabled(state: &ProxyState) -> bool {
+    state
+        .config
+        .try_read()
+        .map(|c| c.enable_logging)
+        .unwrap_or(true)
+}
+
+/// 生成 kiro 请求的唯一 request_id（用量行与明细行共用，用于关联）。
+fn new_kiro_request_id() -> String {
+    format!("kiro_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// 在请求阶段写入「原始请求」与「转接后请求」两条明细到 proxy_request_log_details。
+///
+/// 与用量行通过同一 `request_id` 关联。请求侧明细在发送前即可落库，
+/// 不依赖响应；后续保存响应时可再写 `response_*` kind。
+fn write_kiro_request_details(
+    state: &ProxyState,
+    request_id: &str,
+    log_ctx: &KiroLogContext,
+    upstream_body: Option<&str>,
+) {
+    if !logging_enabled(state) {
+        return;
+    }
+    // 原始客户端请求（脱敏头 + body）
+    if let Err(e) = state.db.insert_request_log_detail(
+        request_id,
+        "request_original",
+        log_ctx.request_headers.as_deref(),
+        log_ctx.request_body.as_deref(),
+    ) {
+        log::warn!("[USG-KIRO] 写入原始请求明细失败: {e}");
+    }
+    // 转接后发往 CodeWhisperer 的请求体（无独立请求头）
+    if let Err(e) =
+        state
+            .db
+            .insert_request_log_detail(request_id, "request_upstream", None, upstream_body)
+    {
+        log::warn!("[USG-KIRO] 写入转接后请求明细失败: {e}");
+    }
+}
+
+/// 异步记录一条 kiro 用量行（套餐：credits 写入 total_cost，token 为估算值）。
+/// `request_id` 与请求明细共用，用于关联。
 #[allow(clippy::too_many_arguments)]
 fn spawn_kiro_log(
     state: &ProxyState,
+    request_id: String,
     provider_id: String,
     app_type: &'static str,
     model: String,
@@ -99,22 +147,15 @@ fn spawn_kiro_log(
     status_code: u16,
     session_id: Option<String>,
     is_streaming: bool,
-    request_headers: Option<String>,
-    request_body: Option<String>,
-    upstream_request_body: Option<String>,
 ) {
-    // 尊重「启用日志」开关
-    if let Ok(config) = state.config.try_read() {
-        if !config.enable_logging {
-            return;
-        }
+    if !logging_enabled(state) {
+        return;
     }
     let db = state.db.clone();
     let output_tokens = usage.output_tokens.min(u32::MAX as u64) as u32;
     let credits = usage.credits;
     tokio::spawn(async move {
         let logger = UsageLogger::new(&db);
-        let request_id = format!("kiro_{}", uuid::Uuid::new_v4().simple());
         if let Err(e) = logger.log_kiro(
             request_id,
             provider_id,
@@ -128,9 +169,6 @@ fn spawn_kiro_log(
             status_code,
             session_id,
             is_streaming,
-            request_headers,
-            request_body,
-            upstream_request_body,
         ) {
             log::warn!("[USG-KIRO] 记录 kiro 用量失败: {e}");
         }
@@ -254,17 +292,19 @@ pub async fn handle_kiro_messages(
     let input_tokens = estimate_input_tokens(body);
     let cw_body = transform_kiro::anthropic_to_cw_request(body);
     let upstream_body = serde_json::to_string(&cw_body).ok();
+    let request_id = new_kiro_request_id();
     let resp = kiro_send(state, &provider, cw_body).await?;
+    write_kiro_request_details(state, &request_id, &log_ctx, upstream_body.as_deref());
 
     if is_stream {
         let cb = build_kiro_log_callback(
             state,
             &provider,
             &log_ctx,
+            request_id,
             model_str,
             input_tokens,
             start,
-            upstream_body,
         );
         let sse =
             transform_kiro::create_anthropic_sse_stream_from_kiro(resp.bytes_stream(), model, cb);
@@ -275,6 +315,7 @@ pub async fn handle_kiro_messages(
     let usage = transform_kiro::extract_kiro_usage(&events);
     spawn_kiro_log(
         state,
+        request_id,
         provider.id.clone(),
         log_ctx.app_type,
         model_str,
@@ -284,9 +325,6 @@ pub async fn handle_kiro_messages(
         StatusCode::OK.as_u16(),
         log_ctx.session_id.clone(),
         false,
-        log_ctx.request_headers.clone(),
-        log_ctx.request_body.clone(),
-        upstream_body,
     );
     let message = transform_kiro::cw_events_to_anthropic_message(&events, model.as_deref());
     Ok((StatusCode::OK, Json(message)).into_response())
@@ -306,17 +344,19 @@ pub async fn handle_kiro_openai_chat(
     let input_tokens = estimate_input_tokens(body);
     let cw_body = transform_kiro::openai_chat_to_cw_request(body);
     let upstream_body = serde_json::to_string(&cw_body).ok();
+    let request_id = new_kiro_request_id();
     let resp = kiro_send(state, &provider, cw_body).await?;
+    write_kiro_request_details(state, &request_id, &log_ctx, upstream_body.as_deref());
 
     if is_stream {
         let cb = build_kiro_log_callback(
             state,
             &provider,
             &log_ctx,
+            request_id,
             model_str,
             input_tokens,
             start,
-            upstream_body,
         );
         let sse =
             transform_kiro::create_openai_sse_stream_from_kiro(resp.bytes_stream(), model, cb);
@@ -327,6 +367,7 @@ pub async fn handle_kiro_openai_chat(
     let usage = transform_kiro::extract_kiro_usage(&events);
     spawn_kiro_log(
         state,
+        request_id,
         provider.id.clone(),
         log_ctx.app_type,
         model_str,
@@ -336,9 +377,6 @@ pub async fn handle_kiro_openai_chat(
         StatusCode::OK.as_u16(),
         log_ctx.session_id.clone(),
         false,
-        log_ctx.request_headers.clone(),
-        log_ctx.request_body.clone(),
-        upstream_body,
     );
     let message = transform_kiro::cw_events_to_openai_message(&events, model.as_deref());
     Ok((StatusCode::OK, Json(message)).into_response())
@@ -363,17 +401,19 @@ pub async fn handle_kiro_responses(
     let chat_body = transform_codex_chat::responses_to_chat_completions(body.clone())?;
     let cw_body = transform_kiro::openai_chat_to_cw_request(&chat_body);
     let upstream_body = serde_json::to_string(&cw_body).ok();
+    let request_id = new_kiro_request_id();
     let resp = kiro_send(state, &provider, cw_body).await?;
+    write_kiro_request_details(state, &request_id, &log_ctx, upstream_body.as_deref());
 
     // CW 字节流 → Chat SSE → Responses SSE
     let cb = build_kiro_log_callback(
         state,
         &provider,
         &log_ctx,
+        request_id,
         model_str,
         input_tokens,
         start,
-        upstream_body,
     );
     let chat_sse =
         transform_kiro::create_openai_sse_stream_from_kiro(resp.bytes_stream(), model, cb);
@@ -386,25 +426,25 @@ pub async fn handle_kiro_responses(
         .into_response())
 }
 
-/// 构造流式完成回调：流结束（含客户端断开）时按累计用量落库一条 kiro 日志。
+/// 构造流式完成回调：流结束（含客户端断开）时按累计用量落库一条 kiro 用量行。
+/// `request_id` 与已写入的请求明细共用，用于关联。
 fn build_kiro_log_callback(
     state: &ProxyState,
     provider: &Provider,
     log_ctx: &KiroLogContext,
+    request_id: String,
     model: String,
     input_tokens: u32,
     start: std::time::Instant,
-    upstream_body: Option<String>,
 ) -> Box<dyn FnOnce(transform_kiro::KiroUsage) + Send> {
     let state = state.clone();
     let provider_id = provider.id.clone();
     let app_type = log_ctx.app_type;
     let session_id = log_ctx.session_id.clone();
-    let request_headers = log_ctx.request_headers.clone();
-    let request_body = log_ctx.request_body.clone();
     Box::new(move |usage| {
         spawn_kiro_log(
             &state,
+            request_id,
             provider_id,
             app_type,
             model,
@@ -414,9 +454,6 @@ fn build_kiro_log_callback(
             StatusCode::OK.as_u16(),
             session_id,
             true,
-            request_headers,
-            request_body,
-            upstream_body,
         );
     })
 }

@@ -10,6 +10,7 @@ import type {
   ModelPricing,
   ProviderLimitStatus,
   PaginatedLogs,
+  RequestLogPayload,
   SessionSyncResult,
   DataSourceSummary,
 } from "@/types/usage";
@@ -140,6 +141,12 @@ export const usageApi = {
 
   getRequestDetail: async (requestId: string): Promise<RequestLog | null> => {
     return invoke("get_request_detail", { requestId });
+  },
+
+  getRequestLogDetails: async (
+    requestId: string,
+  ): Promise<RequestLogPayload[]> => {
+    return invoke("get_request_log_details", { requestId });
   },
 
   getModelPricing: async (): Promise<ModelPricing[]> => {

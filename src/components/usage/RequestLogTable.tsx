@@ -279,38 +279,15 @@ export function RequestLogTable({
                           {fmtInt(log.outputTokens, locale)}
                         </TableCell>
                         <TableCell className="text-center px-1.5">
-                          {(() => {
-                            const credits = log.credits
-                              ? Number.parseFloat(log.credits)
-                              : 0;
-                            // kiro 套餐：以 credits 计量，优先展示
-                            if (Number.isFinite(credits) && credits > 0) {
-                              return (
-                                <div
-                                  className="font-medium tabular-nums"
-                                  title={t("usage.credits", {
-                                    defaultValue: "Credits",
-                                  })}
-                                >
-                                  {credits.toFixed(2)}
-                                  <span className="text-[10px] text-muted-foreground ml-0.5">
-                                    cr
-                                  </span>
-                                </div>
-                              );
-                            }
-                            return (
-                              <div
-                                className={`font-medium tabular-nums ${
-                                  unpriced ? "text-muted-foreground" : ""
-                                }`}
-                              >
-                                {unpriced
-                                  ? t("usage.unpriced", "未定价")
-                                  : fmtUsd(log.totalCostUsd, 4)}
-                              </div>
-                            );
-                          })()}
+                          <div
+                            className={`font-medium tabular-nums ${
+                              unpriced ? "text-muted-foreground" : ""
+                            }`}
+                          >
+                            {unpriced
+                              ? t("usage.unpriced", "未定价")
+                              : fmtUsd(log.totalCostUsd, 4)}
+                          </div>
                           {parseFiniteNumber(log.costMultiplier) != null &&
                             parseFiniteNumber(log.costMultiplier) !== 1 && (
                               <div className="text-[11px] text-muted-foreground">

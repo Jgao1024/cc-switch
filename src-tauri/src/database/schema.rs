@@ -195,9 +195,7 @@ impl Database {
             duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
-            data_source TEXT NOT NULL DEFAULT 'proxy',
-            request_headers TEXT, request_body TEXT, upstream_request_body TEXT,
-            credits TEXT NOT NULL DEFAULT '0'
+            data_source TEXT NOT NULL DEFAULT 'proxy'
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -220,6 +218,13 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         Self::create_request_logs_usage_indexes_if_supported(conn)?;
+
+        // 10b. Proxy Request Log Details 表（请求/响应明细，按 kind 分行存储）
+        // 与 proxy_request_logs 解耦，通过 request_id 关联；kind 取值：
+        //   'request_original'  = 原始客户端请求
+        //   'request_upstream'  = 转接后实际发往上游的请求
+        // 预留 'response_original' / 'response_upstream' 供后续保存返回值使用。
+        Self::create_request_log_details_table(conn)?;
 
         // 11. Model Pricing 表
         conn.execute(
@@ -1277,30 +1282,44 @@ impl Database {
         Ok(())
     }
 
-    /// v11 -> v12 迁移：proxy_request_logs 增加请求明细（原始/转接后请求头与体）
-    /// 以及 kiro 套餐 credits 列。
+    /// v11 -> v12 迁移：新建独立的请求/响应明细表 proxy_request_log_details。
+    ///
+    /// 不改动 proxy_request_logs（保持与 master 一致），明细通过 request_id 关联，
+    /// 按 kind 分行存储，方便后续扩展保存响应内容。
     fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
-        if Self::table_exists(conn, "proxy_request_logs")? {
-            // 原始客户端请求头（脱敏后的 JSON 对象）
-            Self::add_column_if_missing(conn, "proxy_request_logs", "request_headers", "TEXT")?;
-            // 原始客户端请求体（JSON 文本）
-            Self::add_column_if_missing(conn, "proxy_request_logs", "request_body", "TEXT")?;
-            // 转接后实际发往上游的请求体（如 kiro 的 CodeWhisperer body）
-            Self::add_column_if_missing(
-                conn,
-                "proxy_request_logs",
-                "upstream_request_body",
-                "TEXT",
-            )?;
-            // kiro 套餐消耗的 credits（meteringEvent 累计），字符串十进制，默认 '0'
-            Self::add_column_if_missing(
-                conn,
-                "proxy_request_logs",
-                "credits",
-                "TEXT NOT NULL DEFAULT '0'",
-            )?;
-        }
-        log::info!("v11 -> v12 迁移完成：proxy_request_logs 已增加请求明细与 credits 列");
+        Self::create_request_log_details_table(conn)?;
+        log::info!("v11 -> v12 迁移完成：已创建 proxy_request_log_details 明细表");
+        Ok(())
+    }
+
+    /// 创建请求/响应明细表（幂等）。create_tables 与 v11->v12 迁移共用。
+    fn create_request_log_details_table(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proxy_request_log_details (
+                request_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                headers TEXT,
+                body TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (request_id, kind)
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 proxy_request_log_details 失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_log_details_request
+             ON proxy_request_log_details(request_id)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 proxy_request_log_details 索引失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_log_details_created_at
+             ON proxy_request_log_details(created_at)",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Database(format!("创建 proxy_request_log_details 时间索引失败: {e}"))
+        })?;
         Ok(())
     }
 

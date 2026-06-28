@@ -175,6 +175,13 @@ impl Database {
             )
             .map_err(|e| AppError::Database(format!("Pruning old logs failed: {e}")))?;
 
+        // 同步清理明细表中已无对应请求记录的孤儿行（仅当明细表存在）。
+        let _ = conn.execute(
+            "DELETE FROM proxy_request_log_details
+             WHERE request_id NOT IN (SELECT request_id FROM proxy_request_logs)",
+            [],
+        );
+
         Ok(deleted as u64)
     }
 }

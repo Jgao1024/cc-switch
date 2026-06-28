@@ -6,7 +6,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { useRequestDetail } from "@/lib/query/usage";
+import { useRequestDetail, useRequestLogDetails } from "@/lib/query/usage";
 
 interface RequestLogDetailDialogProps {
   /** 选中的请求 ID；为 null 时对话框关闭 */
@@ -24,7 +24,25 @@ function prettyJson(value?: string): string {
   }
 }
 
-function Section({ title, content }: { title: string; content: string }) {
+/** kind → 展示标题（带 i18n 兜底）。 */
+function kindLabel(kind: string, t: (k: string, o?: any) => string): string {
+  switch (kind) {
+    case "request_original":
+      return t("usage.requestOriginal", { defaultValue: "原始请求" });
+    case "request_upstream":
+      return t("usage.requestUpstream", {
+        defaultValue: "转接后请求（发往上游）",
+      });
+    case "response_original":
+      return t("usage.responseOriginal", { defaultValue: "上游响应" });
+    case "response_upstream":
+      return t("usage.responseUpstream", { defaultValue: "转换后响应" });
+    default:
+      return kind;
+  }
+}
+
+function Block({ title, content }: { title: string; content: string }) {
   if (!content) return null;
   return (
     <div className="space-y-1">
@@ -41,7 +59,10 @@ export function RequestLogDetailDialog({
   onClose,
 }: RequestLogDetailDialogProps) {
   const { t } = useTranslation();
-  const { data: detail, isLoading } = useRequestDetail(requestId ?? "");
+  const { data: detail } = useRequestDetail(requestId ?? "");
+  const { data: payloads, isLoading } = useRequestLogDetails(requestId ?? "");
+
+  const hasPayloads = (payloads?.length ?? 0) > 0;
 
   return (
     <Dialog
@@ -50,90 +71,80 @@ export function RequestLogDetailDialog({
         if (!open) onClose();
       }}
     >
-      <DialogContent className="max-w-2xl" zIndex="nested">
+      <DialogContent
+        className="max-w-2xl"
+        zIndex="nested"
+        // 允许点击遮罩/空白处关闭（覆盖基础组件默认阻止外部交互的行为）
+        onInteractOutside={() => {}}
+      >
         <DialogHeader>
           <DialogTitle>
             {t("usage.requestDetail", { defaultValue: "请求详情" })}
           </DialogTitle>
         </DialogHeader>
         <ScrollArea className="flex-1 px-6 py-4">
-          {isLoading || !detail ? (
+          {isLoading ? (
             <div className="h-32 animate-pulse rounded bg-muted/40" />
           ) : (
             <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                <div className="text-muted-foreground">
-                  {t("usage.provider")}
+              {detail && (
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                  <div className="text-muted-foreground">
+                    {t("usage.provider")}
+                  </div>
+                  <div className="text-right font-mono">
+                    {detail.providerName || detail.providerId}
+                  </div>
+                  <div className="text-muted-foreground">
+                    {t("usage.billingModel")}
+                  </div>
+                  <div className="text-right font-mono break-all">
+                    {detail.requestModel && detail.requestModel !== detail.model
+                      ? `${detail.requestModel} → ${detail.model}`
+                      : detail.model}
+                  </div>
+                  <div className="text-muted-foreground">
+                    {t("usage.status")}
+                  </div>
+                  <div className="text-right font-mono">
+                    {detail.statusCode}
+                  </div>
+                  <div className="text-muted-foreground">
+                    {t("usage.inputTokens")} / {t("usage.outputTokens")}
+                  </div>
+                  <div className="text-right font-mono">
+                    {detail.inputTokens} / {detail.outputTokens}
+                  </div>
+                  <div className="text-muted-foreground">{t("usage.time")}</div>
+                  <div className="text-right font-mono">
+                    {new Date(detail.createdAt * 1000).toLocaleString()}
+                  </div>
                 </div>
-                <div className="text-right font-mono">
-                  {detail.providerName || detail.providerId}
-                </div>
-                <div className="text-muted-foreground">
-                  {t("usage.billingModel")}
-                </div>
-                <div className="text-right font-mono break-all">
-                  {detail.requestModel && detail.requestModel !== detail.model
-                    ? `${detail.requestModel} → ${detail.model}`
-                    : detail.model}
-                </div>
-                <div className="text-muted-foreground">{t("usage.status")}</div>
-                <div className="text-right font-mono">{detail.statusCode}</div>
-                <div className="text-muted-foreground">
-                  {t("usage.inputTokens")} / {t("usage.outputTokens")}
-                </div>
-                <div className="text-right font-mono">
-                  {detail.inputTokens} / {detail.outputTokens}
-                </div>
-                {detail.credits != null &&
-                  Number.parseFloat(detail.credits) > 0 && (
-                    <>
-                      <div className="text-muted-foreground">
-                        {t("usage.credits", { defaultValue: "Credits" })}
-                      </div>
-                      <div className="text-right font-mono">
-                        {detail.credits}
-                      </div>
-                    </>
-                  )}
-                <div className="text-muted-foreground">{t("usage.time")}</div>
-                <div className="text-right font-mono">
-                  {new Date(detail.createdAt * 1000).toLocaleString()}
-                </div>
-              </div>
-
-              {detail.errorMessage && (
-                <Section
-                  title={t("usage.errorMessage", { defaultValue: "错误信息" })}
-                  content={detail.errorMessage}
-                />
               )}
 
-              <Section
-                title={t("usage.requestHeaders", {
-                  defaultValue: "原始请求头",
-                })}
-                content={prettyJson(detail.requestHeaders)}
-              />
-              <Section
-                title={t("usage.requestBody", { defaultValue: "原始请求体" })}
-                content={prettyJson(detail.requestBody)}
-              />
-              <Section
-                title={t("usage.upstreamRequestBody", {
-                  defaultValue: "转接后请求体（发往上游）",
-                })}
-                content={prettyJson(detail.upstreamRequestBody)}
-              />
-
-              {!detail.requestHeaders &&
-                !detail.requestBody &&
-                !detail.upstreamRequestBody && (
-                  <div className="text-center text-xs text-muted-foreground py-4">
-                    {t("usage.noRequestDetail", {
-                      defaultValue: "该请求未记录详细请求数据",
-                    })}
+              {hasPayloads ? (
+                payloads!.map((p) => (
+                  <div key={p.kind} className="space-y-2">
+                    <div className="text-xs font-semibold">
+                      {kindLabel(p.kind, t)}
+                    </div>
+                    <Block
+                      title={t("usage.headers", { defaultValue: "请求头" })}
+                      content={prettyJson(p.headers)}
+                    />
+                    <Block
+                      title={t("usage.body", { defaultValue: "请求体" })}
+                      content={prettyJson(p.body)}
+                    />
                   </div>
-                )}
+                ))
+              ) : (
+                <div className="text-center text-xs text-muted-foreground py-4">
+                  {t("usage.noRequestDetail", {
+                    defaultValue: "该请求未记录详细请求数据",
+                  })}
+                </div>
+              )}
             </div>
           )}
         </ScrollArea>

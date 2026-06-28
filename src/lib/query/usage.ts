@@ -142,6 +142,8 @@ export const usageKeys = {
     ] as const,
   detail: (requestId: string) =>
     [...usageKeys.all, "detail", requestId] as const,
+  detailPayloads: (requestId: string) =>
+    [...usageKeys.all, "detail-payloads", requestId] as const,
   pricing: () => [...usageKeys.all, "pricing"] as const,
   limits: (providerId: string, appType: string) =>
     [...usageKeys.all, "limits", providerId, appType] as const,
@@ -335,6 +337,15 @@ export function useRequestDetail(requestId: string) {
   return useQuery({
     queryKey: usageKeys.detail(requestId),
     queryFn: () => usageApi.getRequestDetail(requestId),
+    enabled: !!requestId,
+  });
+}
+
+/** 拉取请求的原始/转接后明细（请求头与体；预留响应）。 */
+export function useRequestLogDetails(requestId: string) {
+  return useQuery({
+    queryKey: usageKeys.detailPayloads(requestId),
+    queryFn: () => usageApi.getRequestLogDetails(requestId),
     enabled: !!requestId,
   });
 }

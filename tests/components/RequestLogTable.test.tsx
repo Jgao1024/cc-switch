@@ -24,6 +24,7 @@ vi.mock("@/lib/query/usage", () => ({
   useRequestLogs: (args: unknown) => useRequestLogsMock(args),
   // RequestLogDetailDialog（详情弹窗）依赖；弹窗默认关闭，返回空数据即可。
   useRequestDetail: () => ({ data: null, isLoading: false }),
+  useRequestLogDetails: () => ({ data: [], isLoading: false }),
 }));
 
 vi.mock("@/components/ui/button", () => ({

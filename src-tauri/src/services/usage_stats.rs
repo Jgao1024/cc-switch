@@ -152,34 +152,34 @@ pub struct RequestLogDetail {
     /// 写入时实际用于计价的模型名。None = v11 前的历史行，"" = 未计价的错误行。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
-    /// 脱敏后的原始客户端请求头（JSON 对象字符串）。列表查询为 None，仅详情返回。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_headers: Option<String>,
-    /// 原始客户端请求体（JSON 文本）。列表查询为 None，仅详情返回。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_body: Option<String>,
-    /// 转接后实际发往上游的请求体（如 kiro 的 CodeWhisperer body）。仅详情返回。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_request_body: Option<String>,
-    /// kiro 套餐消耗的 credits（meteringEvent 累计）。非 kiro 行为 "0"/None。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credits: Option<String>,
 }
 
-/// 把 29 列的查询结果映射为 `RequestLogDetail`。
+/// 请求/响应明细载荷（来自 proxy_request_log_details 表，按 kind 分行）。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 29 列：
+/// kind 取值：`request_original`（原始客户端请求）/ `request_upstream`（转接后发往
+/// 上游的请求）；预留 `response_*` 供后续保存响应使用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogPayload {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub created_at: i64,
+}
+
+/// 把 25 列的查询结果映射为 `RequestLogDetail`。
+///
+/// 调用方的 SELECT **必须**按以下顺序返回 25 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
 ///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
 ///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model, request_headers, request_body,
-///  upstream_request_body, credits`
+///  data_source, pricing_model`
 ///
-/// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可；
-/// 列表查询同理用 `NULL` 占位 request_headers/request_body/upstream_request_body
-/// 以避免传输大字段，仅详情查询返回真实值。
+/// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
     Ok(RequestLogDetail {
         request_id: row.get(0)?,
@@ -209,10 +209,6 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         created_at: row.get(22)?,
         data_source: row.get(23)?,
         pricing_model: row.get(24)?,
-        request_headers: row.get(25)?,
-        request_body: row.get(26)?,
-        upstream_request_body: row.get(27)?,
-        credits: row.get(28)?,
     })
 }
 
@@ -1545,8 +1541,7 @@ impl Database {
                     l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
-                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    NULL AS request_headers, NULL AS request_body, NULL AS upstream_request_body, l.credits
+                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1589,8 +1584,7 @@ impl Database {
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model,
-                    l.request_headers, l.request_body, l.upstream_request_body, l.credits
+                    status_code, error_message, created_at, l.data_source, l.pricing_model
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1606,6 +1600,61 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Database(e.to_string())),
         }
+    }
+
+    /// 写入一条请求/响应明细（proxy_request_log_details），按 (request_id, kind) 去重覆盖。
+    ///
+    /// `kind` 见 [`RequestLogPayload`]。`headers`/`body` 任一可为 None。
+    pub fn insert_request_log_detail(
+        &self,
+        request_id: &str,
+        kind: &str,
+        headers: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        let created_at = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO proxy_request_log_details
+                (request_id, kind, headers, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![request_id, kind, headers, body, created_at],
+        )
+        .map_err(|e| AppError::Database(format!("写入请求明细失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 读取某请求的全部明细行（原始/转接后/未来响应），按 created_at 升序。
+    pub fn get_request_log_details(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<RequestLogPayload>, AppError> {
+        let conn = lock_conn!(self.conn);
+        // 明细表可能尚未创建（极旧库）：查询失败时返回空列表而非报错。
+        let mut stmt = match conn.prepare(
+            "SELECT kind, headers, body, created_at
+             FROM proxy_request_log_details
+             WHERE request_id = ?1
+             ORDER BY created_at ASC, kind ASC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let rows = stmt
+            .query_map([request_id], |row| {
+                Ok(RequestLogPayload {
+                    kind: row.get(0)?,
+                    headers: row.get(1)?,
+                    body: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| AppError::Database(format!("查询请求明细失败: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| AppError::Database(e.to_string()))?);
+        }
+        Ok(out)
     }
 
     /// 检查 Provider 使用限额
@@ -1746,9 +1795,7 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model,
-                        NULL AS request_headers, NULL AS request_body,
-                        NULL AS upstream_request_body, NULL AS credits
+                        data_source, pricing_model
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0
@@ -2268,6 +2315,65 @@ fn should_try_pricing_prefix_match(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_request_log_details_roundtrip() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        // 写入原始与转接后两条明细
+        db.insert_request_log_detail(
+            "kiro_req_1",
+            "request_original",
+            Some(r#"{"authorization":"***"}"#),
+            Some(r#"{"model":"claude","messages":[]}"#),
+        )?;
+        db.insert_request_log_detail(
+            "kiro_req_1",
+            "request_upstream",
+            None,
+            Some(r#"{"conversationState":{}}"#),
+        )?;
+        // 另一个请求的明细不应混入
+        db.insert_request_log_detail("kiro_req_2", "request_original", None, Some("{}"))?;
+
+        let details = db.get_request_log_details("kiro_req_1")?;
+        assert_eq!(details.len(), 2);
+        let kinds: Vec<&str> = details.iter().map(|d| d.kind.as_str()).collect();
+        assert!(kinds.contains(&"request_original"));
+        assert!(kinds.contains(&"request_upstream"));
+        let original = details
+            .iter()
+            .find(|d| d.kind == "request_original")
+            .unwrap();
+        assert_eq!(
+            original.headers.as_deref(),
+            Some(r#"{"authorization":"***"}"#)
+        );
+        assert!(original.body.as_deref().unwrap().contains("messages"));
+        let upstream = details
+            .iter()
+            .find(|d| d.kind == "request_upstream")
+            .unwrap();
+        assert!(upstream.headers.is_none());
+        assert!(upstream
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("conversationState"));
+
+        // INSERT OR REPLACE：同 (request_id, kind) 覆盖
+        db.insert_request_log_detail("kiro_req_1", "request_original", None, Some("updated"))?;
+        let details = db.get_request_log_details("kiro_req_1")?;
+        assert_eq!(details.len(), 2);
+        let original = details
+            .iter()
+            .find(|d| d.kind == "request_original")
+            .unwrap();
+        assert_eq!(original.body.as_deref(), Some("updated"));
+
+        // 未知请求返回空
+        assert!(db.get_request_log_details("nope")?.is_empty());
+        Ok(())
+    }
 
     fn local_ts(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
         match Local.with_ymd_and_hms(year, month, day, hour, minute, second) {

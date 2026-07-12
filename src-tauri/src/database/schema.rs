@@ -302,6 +302,35 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // 19. Profiles 表（全应用共享的项目实体，payload 按 app 分槽快照
+        //     供应商/MCP/Skills/Prompt；各应用分组的 current 标记在 settings 表）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                sort_order INTEGER,
+                created_at INTEGER,
+                updated_at INTEGER
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
+        // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
+        if conn
+            .execute(
+                "INSERT OR REPLACE INTO settings (key, value)
+                 SELECT 'current_profile_id_claude', value FROM settings
+                 WHERE key = 'current_profile_id'",
+                [],
+            )
+            .is_ok()
+        {
+            let _ = conn.execute("DELETE FROM settings WHERE key = 'current_profile_id'", []);
+        }
+
         // 尝试添加 live_takeover_active 列到 proxy_config 表
         let _ = conn.execute(
             "ALTER TABLE proxy_config ADD COLUMN live_takeover_active INTEGER NOT NULL DEFAULT 0",
@@ -452,6 +481,11 @@ impl Database {
                         Self::set_user_version(conn, 11)?;
                     }
                     11 => {
+                        log::info!("迁移数据库从 v11 到 v12（添加项目 Profiles 表）");
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
+                    }
+                    12 => {
                         log::info!("迁移数据库从 v11 到 v12（proxy_request_logs 增加请求头/体明细与 credits 列）");
                         Self::migrate_v11_to_v12(conn)?;
                         Self::set_user_version(conn, 12)?;
@@ -1282,6 +1316,24 @@ impl Database {
         Ok(())
     }
 
+    /// v11 -> v12 迁移：添加项目 Profiles 表
+    /// 与 create_tables_on_conn 中的建表语句保持一致（IF NOT EXISTS 保证幂等）
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                sort_order INTEGER,
+                created_at INTEGER,
+                updated_at INTEGER
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("v11 -> v12 创建 profiles 表失败: {e}")))?;
+        Ok(())
+    }
+
     /// v11 -> v12 迁移：新建独立的请求/响应明细表 proxy_request_log_details。
     ///
     /// 不改动 proxy_request_logs（保持与 master 一致），明细通过 request_id 关联，
@@ -1353,6 +1405,15 @@ impl Database {
                 "25",
                 "0.50",
                 "6.25",
+            ),
+            // Claude Sonnet 5（list 价，与 Sonnet 4.6 一致；促销 $2/$10 至 2026-08-31 不入表）
+            (
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "3",
+                "15",
+                "0.30",
+                "3.75",
             ),
             // Claude 4.7 系列
             (

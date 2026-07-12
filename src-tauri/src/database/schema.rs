@@ -1316,8 +1316,9 @@ impl Database {
         Ok(())
     }
 
-    /// v11 -> v12 迁移：添加项目 Profiles 表
-    /// 与 create_tables_on_conn 中的建表语句保持一致（IF NOT EXISTS 保证幂等）
+    /// v11 -> v12 迁移：
+    /// 1. 添加项目 Profiles 表（与 create_tables_on_conn 中的建表语句保持一致，IF NOT EXISTS 保证幂等）
+    /// 2. 新建独立的请求/响应明细表 proxy_request_log_details
     fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS profiles (
@@ -1331,16 +1332,8 @@ impl Database {
             [],
         )
         .map_err(|e| AppError::Database(format!("v11 -> v12 创建 profiles 表失败: {e}")))?;
-        Ok(())
-    }
-
-    /// v11 -> v12 迁移：新建独立的请求/响应明细表 proxy_request_log_details。
-    ///
-    /// 不改动 proxy_request_logs（保持与 master 一致），明细通过 request_id 关联，
-    /// 按 kind 分行存储，方便后续扩展保存响应内容。
-    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
         Self::create_request_log_details_table(conn)?;
-        log::info!("v11 -> v12 迁移完成：已创建 proxy_request_log_details 明细表");
+        log::info!("v11 -> v12 迁移完成：已创建 profiles 表和 proxy_request_log_details 明细表");
         Ok(())
     }
 

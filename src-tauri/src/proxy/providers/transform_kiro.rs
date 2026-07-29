@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use super::kiro_auth::protocol;
 
 /// CodeWhisperer 请求的 origin。
-/// 用 `AI_EDITOR` 而非 `CLI`，以解锁完整模型集（含 claude-sonnet-4.6 / claude-opus-4.8）；
+/// 用 `AI_EDITOR` 而非 `CLI`，以解锁完整模型集（含 claude-sonnet-5 / claude-opus-4.8）；
 /// `CLI` origin 仅暴露 sonnet-4.5/sonnet-4/haiku-4.5。
 const ORIGIN: &str = "AI_EDITOR";
 
@@ -20,7 +20,7 @@ const ORIGIN: &str = "AI_EDITOR";
 ///
 /// - 已是合法 CW modelId 的，原样透传；
 /// - 含 "opus" → `claude-opus-4.8`；
-/// - 其余（sonnet / haiku / 未知）→ `claude-sonnet-4.6`。
+/// - 其余（sonnet / haiku / 未知）→ [`protocol::DEFAULT_MODEL_ID`]（集中配置，升级默认模型只需改该常量）。
 pub fn map_model_to_cw(requested: Option<&str>) -> String {
     let m = requested.unwrap_or("").trim().to_ascii_lowercase();
     const KNOWN: &[&str] = &[
@@ -28,6 +28,7 @@ pub fn map_model_to_cw(requested: Option<&str>) -> String {
         "claude-opus-4.7",
         "claude-opus-4.6",
         "claude-opus-4.5",
+        protocol::DEFAULT_MODEL_ID,
         "claude-sonnet-4.6",
         "claude-sonnet-4.5",
         "claude-sonnet-4",
@@ -40,7 +41,7 @@ pub fn map_model_to_cw(requested: Option<&str>) -> String {
     if m.contains("opus") {
         return "claude-opus-4.8".to_string();
     }
-    "claude-sonnet-4.6".to_string()
+    protocol::DEFAULT_MODEL_ID.to_string()
 }
 
 // ===================================================================
@@ -1455,8 +1456,8 @@ mod tests {
         let cw = anthropic_to_cw_request(&body);
         let cur = &cw["conversationState"]["currentMessage"]["userInputMessage"];
         assert_eq!(cur["origin"], "AI_EDITOR");
-        // 模型映射：sonnet → claude-sonnet-4.6
-        assert_eq!(cur["modelId"], "claude-sonnet-4.6");
+        // 模型映射：sonnet → claude-sonnet-5
+        assert_eq!(cur["modelId"], "claude-sonnet-5");
         // system 注入到首条 user 文本
         assert!(cur["content"]
             .as_str()
@@ -1475,18 +1476,18 @@ mod tests {
         );
         assert_eq!(
             map_model_to_cw(Some("claude-3-5-sonnet")),
-            "claude-sonnet-4.6"
+            "claude-sonnet-5"
         );
         assert_eq!(
             map_model_to_cw(Some("claude-3-5-haiku")),
-            "claude-sonnet-4.6"
+            "claude-sonnet-5"
         );
         assert_eq!(map_model_to_cw(Some("claude-opus-4.8")), "claude-opus-4.8");
         assert_eq!(
             map_model_to_cw(Some("claude-sonnet-4.6")),
             "claude-sonnet-4.6"
         );
-        assert_eq!(map_model_to_cw(None), "claude-sonnet-4.6");
+        assert_eq!(map_model_to_cw(None), "claude-sonnet-5");
     }
 
     #[test]

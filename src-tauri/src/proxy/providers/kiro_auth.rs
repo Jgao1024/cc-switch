@@ -43,7 +43,7 @@ pub mod protocol {
     pub const HEADER_OPTOUT: &str = "x-amzn-codewhisperer-optout";
 
     /// 后端默认模型标识（响应中回传的 modelId）
-    pub const DEFAULT_MODEL_ID: &str = "claude-sonnet-4.6";
+    pub const DEFAULT_MODEL_ID: &str = "claude-sonnet-5";
 }
 
 /// kiro 套餐用量额度（来自 `GetUsageLimits`）。
@@ -400,7 +400,7 @@ impl KiroAuthManager {
         Ok(arn)
     }
 
-    /// 列出 CodeWhisperer 可用模型（origin=AI_EDITOR，含 sonnet-4.6 / opus-4.8 等）。
+    /// 列出 CodeWhisperer 可用模型（origin=AI_EDITOR，含 sonnet-5 / opus-4.8 等）。
     /// 返回 (modelId, description)。
     pub async fn list_models(&self) -> Result<Vec<(String, Option<String>)>, KiroAuthError> {
         let token = self.get_valid_token().await?;
@@ -632,7 +632,7 @@ mod tests {
         let models = mgr.list_models().await.expect("list_models failed");
         let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
         println!("[live] models = {ids:?}");
-        assert!(ids.iter().any(|m| m.contains("sonnet-4.6")));
+        assert!(ids.iter().any(|m| m.contains("sonnet-5")));
         assert!(ids.iter().any(|m| m.contains("opus-4.8")));
     }
 

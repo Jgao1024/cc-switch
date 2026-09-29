@@ -69,11 +69,13 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
     opencode: boolean;
     openclaw: boolean;
     hermes: boolean;
+    mcode: boolean;
   }>(() => {
     if (initialData?.apps) {
       return {
         ...initialData.apps,
         grokbuild: initialData.apps.grokbuild ?? false,
+        mcode: initialData.apps.mcode ?? false,
       };
     }
     return {
@@ -84,6 +86,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       opencode: defaultEnabledApps.includes("opencode"),
       openclaw: defaultEnabledApps.includes("openclaw"),
       hermes: defaultEnabledApps.includes("hermes"),
+      mcode: defaultEnabledApps.includes("mcode"),
     };
   });
 
@@ -118,6 +121,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
 
   const [configError, setConfigError] = useState("");
   const [saving, setSaving] = useState(false);
+  const savingRef = React.useRef(false);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [idError, setIdError] = useState("");
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -288,6 +292,8 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
   };
 
   const handleSubmit = async () => {
+    if (savingRef.current) return;
+
     const trimmedId = formId.trim();
     if (!trimmedId) {
       toast.error(t("mcp.error.idRequired"), { duration: 3000 });
@@ -357,6 +363,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       return;
     }
 
+    savingRef.current = true;
     setSaving(true);
     try {
       const nameTrimmed = (formName || trimmedId).trim();
@@ -410,6 +417,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       const msg = mapped || detail || t("mcp.error.saveFailed");
       toast.error(msg, { duration: mapped || detail ? 6000 : 4000 });
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -423,7 +431,9 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       <FullScreenPanel
         isOpen={true}
         title={getFormTitle()}
-        onClose={onClose}
+        onClose={() => {
+          if (!savingRef.current) onClose();
+        }}
         footer={
           <Button
             type="button"
@@ -616,6 +626,21 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                     className="text-sm text-foreground cursor-pointer select-none"
                   >
                     {t("mcp.unifiedPanel.apps.hermes")}
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="enable-mcode"
+                    checked={enabledApps.mcode}
+                    onCheckedChange={(checked: boolean) =>
+                      setEnabledApps({ ...enabledApps, mcode: checked })
+                    }
+                  />
+                  <label
+                    htmlFor="enable-mcode"
+                    className="text-sm text-foreground cursor-pointer select-none"
+                  >
+                    {t("mcp.unifiedPanel.apps.mcode")}
                   </label>
                 </div>
               </div>
